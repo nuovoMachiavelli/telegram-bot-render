@@ -121,7 +121,7 @@ async def process_phone(phone_norm: str, message: Message):
         print(f"CRITICAL ERROR в process_phone: {e}")
         await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= УЛЬТРА-БЫСТРЫЙ /sync (1-2 запроса всего) =================
+# ================= ПРОСТОЙ И БЕЗОПАСНЫЙ /sync =================
 @dp.message(Command("sync"))
 async def sync_clients(message: Message):
     print(f"DEBUG: /sync от {message.from_user.id}")
@@ -129,25 +129,17 @@ async def sync_clients(message: Message):
         await message.answer("Доступ запрещён.")
         return
 
-    await message.answer("🔄 Запускаю синхронизацию (batch-режим)...")
+    await message.answer("🔄 Запускаю синхронизацию (только новые клиенты)...")
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         clients = await async_worksheet(spreadsheet, "Clients")
         
         values = await asyncio.to_thread(clients.get_all_values)
-        
-        existing = {}
-        for i, row in enumerate(values[1:], start=2):
-            if not isinstance(row, (list, tuple)) or len(row) < 1: continue
-            phone_norm = normalize_phone(row[0])
-            if phone_norm:
-                tg_id = str(row[1]).strip() if len(row) > 1 else ""
-                existing[phone_norm] = {'index': i, 'has_tg': bool(tg_id and tg_id != "0")}
+        existing = {normalize_phone(row[0]) for row in values[1:] 
+                   if isinstance(row, (list, tuple)) and len(row) > 0}
 
         new_rows = []
-        update_requests = []  # ← всё сюда для ОДНОГО batch_update
         added = 0
-        updated = 0
 
         for idx, sid in enumerate(MANAGER_SHEETS, 1):
             await message.answer(f"→ Проверяю таблицу менеджера {idx}/7...")
@@ -157,56 +149,44 @@ async def sync_clients(message: Message):
                 data = await asyncio.to_thread(sheet.get_all_values)
 
                 for row in data[1:]:
-                    if not isinstance(row, (list, tuple)) or len(row) < 6: continue
+                    if not isinstance(row, (list, tuple)) or len(row) < 6:
+                        continue
                     
                     phone_raw   = str(row[4]) if len(row) > 4 else ""
                     region      = str(row[1]).strip() if len(row) > 1 else ""
                     client_name = str(row[5]).strip() if len(row) > 5 else ""
 
                     phone_norm = normalize_phone(phone_raw)
-                    if not phone_norm: continue
+                    if not phone_norm or phone_norm in existing:
+                        continue
 
-                    if phone_norm in existing:
-                        info = existing[phone_norm]
-                        update_requests.extend([
-                            {"range": f"C{info['index']}", "values": [[client_name]]},
-                            {"range": f"E{info['index']}", "values": [[f"Таблица {idx}"]]},
-                            {"range": f"F{info['index']}", "values": [[region]]}
-                        ])
-                        if info['has_tg']:
-                            update_requests.append({"range": f"D{info['index']}", "values": [["привязан"]]})
-                        updated += 1
-                    else:
-                        new_rows.append([phone_norm, "", client_name, "не привязан", f"Таблица {idx}", region])
-                        added += 1
-                        
+                    new_rows.append([
+                        phone_norm,          # A
+                        "",                  # B
+                        client_name,         # C — ФИО
+                        "не привязан",       # D
+                        f"Таблица {idx}",    # E
+                        region               # F
+                    ])
+                    existing.add(phone_norm)
+                    added += 1
+                    
             except Exception as e:
                 await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:100]}")
-                print(f"Полная ошибка таблицы {idx}: {e}")
                 continue
 
-        # === ОДИН batch_update на всё ===
-        if update_requests:
-            await asyncio.to_thread(
-                clients.batch_update,
-                {"valueInputOption": "RAW", "data": update_requests}
-            )
-
-        # === Одна пакетная вставка новых ===
         if new_rows:
             await async_append_rows(clients, new_rows)
-
-        await message.answer(f"""✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!
-Добавлено новых: {added}
-Обновлено существующих: {updated}
-(все изменения записаны за 1-2 запроса к Google)""")
+            await message.answer(f"✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА! Добавлено новых клиентов: {added}")
+        else:
+            await message.answer("✅ Всё уже синхронизировано, новых клиентов нет.")
 
     except Exception as e:
         print(f"CRITICAL SYNC ERROR: {e}")
-        await message.answer(f"❌ Критическая ошибка синхронизации: {str(e)}")
+        await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
 
 
-# ================= ОСТАЛЬНОЕ =================
+# ================= ОСТАЛЬНЫЕ ХЕНДЛЕРЫ (без изменений) =================
 @dp.message(Command("stats"))
 async def stats(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -273,7 +253,7 @@ async def main():
         print("❌ Укажи BASE_WEBHOOK_URL!")
         return
     dp.startup.register(on_startup)
-    print("✅ Бот запущен | /sync теперь использует batch (429 больше не будет)")
+    print("✅ Бот запущен | /sync упрощён и защищён")
     
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
