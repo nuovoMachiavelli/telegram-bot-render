@@ -2,13 +2,11 @@ import asyncio
 import json
 import os
 from datetime import datetime
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram import types as aiogram_types
-
 import gspread
 from google.oauth2.service_account import Credentials
 from aiohttp import web
@@ -18,7 +16,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
 MAIN_SHEET_ID = os.getenv("MAIN_SHEET_ID")
 GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDS") or "{}")
-
 BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 WEBAPP_HOST = "0.0.0.0"
@@ -36,7 +33,6 @@ MANAGER_SHEETS = [
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
 gc = None
 
 def normalize_phone(raw):
@@ -83,7 +79,7 @@ async def process_phone(phone_norm: str, message: Message):
         spreadsheet = await async_open(MAIN_SHEET_ID)
         worksheet = await async_worksheet(spreadsheet, "Clients")
         values = await asyncio.to_thread(worksheet.get_all_values)
-
+        
         row_index = None
         for i, row in enumerate(values[1:], start=2):
             if row and normalize_phone(row[0]) == phone_norm:
@@ -92,20 +88,21 @@ async def process_phone(phone_norm: str, message: Message):
 
         found_in = None
         region = ""
-        client_name = ""                    # ← НОВОЕ: имя из столбца F
+        client_name = ""  # ← Имя из столбца F
+
         for idx, sid in enumerate(MANAGER_SHEETS, 1):
             try:
                 s = await async_open(sid)
                 sheet = await async_worksheet(s, "Общий")
-                col_e = await async_col_values(sheet, 5)   # телефон
-                col_b = await async_col_values(sheet, 2)   # регион
-                col_f = await async_col_values(sheet, 6)   # ← ИМЯ (столбец F)
+                col_e = await async_col_values(sheet, 5)  # телефон (E)
+                col_b = await async_col_values(sheet, 2)  # регион (B)
+                col_f = await async_col_values(sheet, 6)  # ФИО (F)
 
                 for j in range(min(len(col_e), len(col_b), len(col_f))):
                     if normalize_phone(col_e[j]) == phone_norm:
                         found_in = f"Таблица {idx}"
                         region = str(col_b[j]).strip()
-                        client_name = str(col_f[j]).strip()   # ← БЕРЁМ ИМЯ ИЗ F
+                        client_name = str(col_f[j]).strip()
                         break
                 if found_in: break
             except Exception as e:
@@ -114,19 +111,24 @@ async def process_phone(phone_norm: str, message: Message):
 
         if found_in:
             if row_index:
-                # Обновляем всё, включая имя из F
+                # Обновляем существующую строку
                 await async_update(worksheet, f"B{row_index}", [[message.chat.id]])
-                await async_update(worksheet, f"C{row_index}", [[client_name]])   # ← username
+                await async_update(worksheet, f"C{row_index}", [[client_name]])  # ← username из F
                 await async_update(worksheet, f"F{row_index}", [["привязан"]])
                 await async_update(worksheet, f"G{row_index}", [[found_in]])
                 await async_update(worksheet, f"H{row_index}", [[region]])
                 await message.answer("✅ Вы успешно привязаны! Telegram ID и имя обновлены.")
             else:
+                # Добавляем новую строку
                 await async_append_row(worksheet, [
-                    phone_norm, message.chat.id, client_name,          # ← username из F
+                    phone_norm,
+                    message.chat.id,
+                    client_name,                    # ← username из F
                     message.from_user.full_name,
                     datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "привязан", found_in, region
+                    "привязан",
+                    found_in,
+                    region
                 ])
                 await message.answer("✅ Вы успешно привязаны!")
         else:
@@ -142,40 +144,61 @@ async def sync_clients(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещён.")
         return
+
     await message.answer("🔄 Запускаю синхронизацию...")
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         clients = await async_worksheet(spreadsheet, "Clients")
-        data = await async_get_all_records(clients)
-        existing = {normalize_phone(row.get("phone_normalized", "")) for row in data if row.get("phone_normalized")}
+        
+        # Надёжный сбор уже существующих номеров (по столбцу A)
+        values = await asyncio.to_thread(clients.get_all_values)
+        existing = {normalize_phone(row[0]) for row in values[1:] if row and len(row) > 0 and row[0]}
+
         added = 0
         for idx, sid in enumerate(MANAGER_SHEETS, 1):
             await message.answer(f"→ Проверяю таблицу менеджера {idx}/7...")
             try:
                 s = await async_open(sid)
                 sheet = await async_worksheet(s, "Общий")
-                phones = await async_col_values(sheet, 5)
-                regions = await async_col_values(sheet, 2)
-                names = await async_col_values(sheet, 6)          # ← ИМЯ ИЗ F
+                data = await asyncio.to_thread(sheet.get_all_values)   # ← главное исправление
 
-                for i in range(1, len(phones)):
-                    phone_norm = normalize_phone(phones[i])
-                    if not phone_norm or phone_norm in existing: continue
-                    region = regions[i] if i < len(regions) else ""
-                    client_name = str(names[i]).strip() if i < len(names) else ""   # ← БЕРЁМ ИЗ F
+                for row in data[1:]:  # пропускаем заголовок
+                    if len(row) < 6:  # минимум до столбца F
+                        continue
+                    
+                    phone_raw   = str(row[4]) if len(row) > 4 else ""   # E (телефон)
+                    region      = str(row[1]).strip() if len(row) > 1 else ""  # B (регион)
+                    client_name = str(row[5]).strip() if len(row) > 5 else ""  # F (ФИО → username)
+
+                    phone_norm = normalize_phone(phone_raw)
+                    if not phone_norm or phone_norm in existing:
+                        continue
+
+                    # Добавляем новую строку
                     await async_append_row(clients, [
-                        phone_norm, "", client_name, "",               # ← username из F
-                        datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "не привязан", f"Таблица {idx}", region
+                        phone_norm,                                 # A
+                        "",                                         # B (telegram_id)
+                        client_name,                                # C ← ФИО из столбца F
+                        "",                                         # D
+                        datetime.now().strftime("%Y-%m-%d %H:%M"),  # E
+                        "не привязан",                              # F
+                        f"Таблица {idx}",                           # G
+                        region                                      # H
                     ])
+                    
                     existing.add(phone_norm)
                     added += 1
+                    
             except Exception as e:
-                await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:100]}")
+                await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:150]}")
                 continue
-        await message.answer(f"✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА! Добавлено: {added}")
+
+        await message.answer(f"✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА! Добавлено новых клиентов: {added}")
+        
     except Exception as e:
+        print(f"CRITICAL SYNC ERROR: {e}")
         await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
+
 
 @dp.message(Command("stats"))
 async def stats(message: Message):
@@ -193,6 +216,7 @@ async def stats(message: Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка stats: {str(e)}")
 
+
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -200,11 +224,17 @@ async def broadcast_cmd(message: Message):
         return
     await message.answer("✅ Рассылка готова (заглушка)")
 
+
 # ================= ОБЫЧНЫЕ ХЕНДЛЕРЫ =================
 @dp.message(Command("start"))
 async def start(message: Message):
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
     await message.answer("Привет! Нажми кнопку или напиши номер цифрами.", reply_markup=kb)
+
 
 @dp.message(F.contact)
 async def handle_contact(message: Message):
@@ -213,6 +243,7 @@ async def handle_contact(message: Message):
     if phone_norm:
         await process_phone(phone_norm, message)
 
+
 @dp.message(F.text & ~F.command)
 async def handle_manual_phone(message: Message):
     phone_norm = normalize_phone(message.text)
@@ -220,31 +251,38 @@ async def handle_manual_phone(message: Message):
         await message.answer("🔍 Проверяю номер...")
         await process_phone(phone_norm, message)
 
+
 # ================= ЗАПУСК =================
 async def on_startup(bot: Bot):
     global gc
-    creds = Credentials.from_service_account_info(GOOGLE_CREDS, scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
+    creds = Credentials.from_service_account_info(
+        GOOGLE_CREDS,
+        scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    )
     gc = gspread.authorize(creds)
     await bot.set_webhook(f"{BASE_WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}")
     print(f"✅ Webhook установлен: {BASE_WEBHOOK_URL}{WEBHOOK_PATH}")
+
 
 async def main():
     if not BASE_WEBHOOK_URL:
         print("❌ Укажи BASE_WEBHOOK_URL!")
         return
+    
     dp.startup.register(on_startup)
-    print("✅ Бот запущен на Render (username из столбца F добавлен)")
-
+    print("✅ Бот запущен (ФИО теперь корректно добавляется в столбец C при /sync)")
+    
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
-
+    
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host=WEBAPP_HOST, port=WEBAPP_PORT)
     await site.start()
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
