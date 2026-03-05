@@ -64,7 +64,7 @@ async def error_handler(event: aiogram_types.ErrorEvent):
     except:
         pass
 
-# ================= ПРИВЯЗКА НОМЕРА =================
+# ================= ПРИВЯЗКА НОМЕРА (без изменений) =================
 async def process_phone(phone_norm: str, message: Message):
     print(f"DEBUG: Обработка номера {phone_norm}")
     try:
@@ -121,7 +121,104 @@ async def process_phone(phone_norm: str, message: Message):
         print(f"CRITICAL ERROR в process_phone: {e}")
         await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= ПРОСТОЙ И БЕЗОПАСНЫЙ /sync =================
+# ================= УМНАЯ РАССЫЛКА (с защитой от бана) =================
+@dp.message(Command("broadcast"))
+async def broadcast_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Доступ запрещён.")
+        return
+
+    await message.answer("🚀 Запускаю рассылку из листа «Рассылка»...\n"
+                         "Буду отправлять по 1 сообщению каждые 2 секунды (защита от бана Telegram).")
+
+    try:
+        spreadsheet = await async_open(MAIN_SHEET_ID)
+        rassylka = await async_worksheet(spreadsheet, "Рассылка")
+        clients_sheet = await async_worksheet(spreadsheet, "Clients")
+
+        data = await asyncio.to_thread(rassylka.get_all_values)
+        clients_data = await asyncio.to_thread(clients_sheet.get_all_values)
+
+        # Создаём словарь телефон → telegram_id из Clients
+        phone_to_tg = {}
+        for row in clients_data[1:]:
+            if isinstance(row, (list, tuple)) and len(row) > 1:
+                phone_norm = normalize_phone(row[0])
+                if phone_norm:
+                    tg_id = str(row[1]).strip()
+                    if tg_id and tg_id != "0":
+                        phone_to_tg[phone_norm] = tg_id
+
+        sent = 0
+        skipped = 0
+        errors = 0
+
+        for i, row in enumerate(data[1:], start=2):  # пропускаем заголовок
+            if not isinstance(row, (list, tuple)) or len(row) < 9:
+                continue
+
+            # Столбцы (0-based):
+            # 0: Менеджер, 1: Область, 2: Телефон, 3: ФИО,
+            # 4: Номер магазина, 5: Сумма, 6: Ссылка, 7: Период,
+            # 8: Статус, 9: Время отправки
+
+            status = str(row[8]).strip().lower() if len(row) > 8 else ""
+            if status in ("отправлено", "отправлен"):
+                continue  # уже отправлено
+
+            phone_raw = str(row[2]) if len(row) > 2 else ""
+            phone_norm = normalize_phone(phone_raw)
+            shop_number = str(row[4]).strip() if len(row) > 4 else "—"
+            amount = str(row[5]).strip() if len(row) > 5 else "—"
+            link = str(row[6]).strip() if len(row) > 6 else ""
+            period = str(row[7]).strip() if len(row) > 7 else "—"
+
+            if not phone_norm:
+                continue
+
+            tg_id = phone_to_tg.get(phone_norm)
+            if not tg_id:
+                await rassylka.update(f"I{i}", [["нет Telegram ID"]])
+                skipped += 1
+                continue
+
+            text = f"""Оплата за магазин {shop_number}
+Сумма {amount}
+За период {period}
+
+{link}"""
+
+            try:
+                await bot.send_message(chat_id=tg_id, text=text)
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                await asyncio.gather(
+                    rassylka.update(f"I{i}", [["отправлено"]]),
+                    rassylka.update(f"J{i}", [[now]])
+                )
+
+                sent += 1
+                await message.answer(f"✅ Отправлено {sent} | Пропущено {skipped} | Ошибок {errors}")
+
+                # ЗАЩИТА ОТ БАНА: 2 секунды между сообщениями (очень безопасно даже для 3000+)
+                await asyncio.sleep(2.0)
+
+            except Exception as e:
+                print(f"Ошибка отправки {phone_norm}: {e}")
+                errors += 1
+                await rassylka.update(f"I{i}", [[f"ошибка: {str(e)[:50]}"]])
+
+        await message.answer(f"""🎉 РАССЫЛКА ЗАВЕРШЕНА!
+Отправлено: {sent}
+Пропущено (нет TG): {skipped}
+Ошибок: {errors}""")
+
+    except Exception as e:
+        print(f"CRITICAL BROADCAST ERROR: {e}")
+        await message.answer(f"❌ Критическая ошибка рассылки: {str(e)}")
+
+
+# ================= ОСТАЛЬНЫЕ КОМАНДЫ (без изменений) =================
 @dp.message(Command("sync"))
 async def sync_clients(message: Message):
     print(f"DEBUG: /sync от {message.from_user.id}")
@@ -160,14 +257,7 @@ async def sync_clients(message: Message):
                     if not phone_norm or phone_norm in existing:
                         continue
 
-                    new_rows.append([
-                        phone_norm,          # A
-                        "",                  # B
-                        client_name,         # C — ФИО
-                        "не привязан",       # D
-                        f"Таблица {idx}",    # E
-                        region               # F
-                    ])
+                    new_rows.append([phone_norm, "", client_name, "не привязан", f"Таблица {idx}", region])
                     existing.add(phone_norm)
                     added += 1
                     
@@ -186,7 +276,6 @@ async def sync_clients(message: Message):
         await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
 
 
-# ================= ОСТАЛЬНЫЕ ХЕНДЛЕРЫ (без изменений) =================
 @dp.message(Command("stats"))
 async def stats(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -203,14 +292,7 @@ async def stats(message: Message):
         await message.answer(f"❌ Ошибка stats: {str(e)}")
 
 
-@dp.message(Command("broadcast"))
-async def broadcast_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Доступ запрещён.")
-        return
-    await message.answer("✅ Рассылка готова (заглушка)")
-
-
+# ================= ОБЫЧНЫЕ ХЕНДЛЕРЫ =================
 @dp.message(Command("start"))
 async def start(message: Message):
     kb = ReplyKeyboardMarkup(
@@ -253,7 +335,7 @@ async def main():
         print("❌ Укажи BASE_WEBHOOK_URL!")
         return
     dp.startup.register(on_startup)
-    print("✅ Бот запущен | /sync упрощён и защищён")
+    print("✅ Бот запущен | Рассылка /broadcast с защитой от бана готова!")
     
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
