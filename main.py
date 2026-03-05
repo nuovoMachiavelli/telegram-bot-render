@@ -51,11 +51,10 @@ async def async_open(spreadsheet_id):
 async def async_worksheet(spreadsheet, title):
     return await asyncio.to_thread(spreadsheet.worksheet, title)
 
-async def async_append_row(worksheet, row):
-    return await asyncio.to_thread(worksheet.append_row, row)
-
-async def async_update(worksheet, range_name, values):
-    return await asyncio.to_thread(worksheet.update, range_name, values)
+async def async_append_rows(worksheet, rows_list):          # ← НОВОЕ: пакетная вставка
+    return await asyncio.to_thread(
+        worksheet.append_rows, rows_list, value_input_option="RAW"
+    )
 
 # ================= ОБРАБОТЧИК ОШИБОК =================
 @dp.error()
@@ -74,7 +73,6 @@ async def process_phone(phone_norm: str, message: Message):
         worksheet = await async_worksheet(spreadsheet, "Clients")
         values = await asyncio.to_thread(worksheet.get_all_values)
 
-        # Ищем строку по телефону (столбец A)
         row_index = None
         for i, row in enumerate(values[1:], start=2):
             if row and normalize_phone(row[0] if len(row) > 0 else "") == phone_norm:
@@ -83,15 +81,15 @@ async def process_phone(phone_norm: str, message: Message):
 
         found_in = None
         region = ""
-        client_name = ""  # ФИО из столбца F менеджеров
+        client_name = ""
 
         for idx, sid in enumerate(MANAGER_SHEETS, 1):
             try:
                 s = await async_open(sid)
                 sheet = await async_worksheet(s, "Общий")
-                col_e = await asyncio.to_thread(sheet.col_values, 5)  # E — телефон
-                col_b = await asyncio.to_thread(sheet.col_values, 2)  # B — регион
-                col_f = await asyncio.to_thread(sheet.col_values, 6)  # F — ФИО
+                col_e = await asyncio.to_thread(sheet.col_values, 5)
+                col_b = await asyncio.to_thread(sheet.col_values, 2)
+                col_f = await asyncio.to_thread(sheet.col_values, 6)
 
                 for j in range(min(len(col_e), len(col_b), len(col_f))):
                     if normalize_phone(col_e[j]) == phone_norm:
@@ -106,22 +104,15 @@ async def process_phone(phone_norm: str, message: Message):
 
         if found_in:
             if row_index:
-                # Обновляем существующую строку
-                await async_update(worksheet, f"B{row_index}", [[message.chat.id]])
-                await async_update(worksheet, f"C{row_index}", [[client_name]])   # ФИО
-                await async_update(worksheet, f"D{row_index}", [["привязан"]])
-                await async_update(worksheet, f"E{row_index}", [[found_in]])
-                await async_update(worksheet, f"F{row_index}", [[region]])
+                await asyncio.to_thread(worksheet.update, f"B{row_index}", [[message.chat.id]])
+                await asyncio.to_thread(worksheet.update, f"C{row_index}", [[client_name]])
+                await asyncio.to_thread(worksheet.update, f"D{row_index}", [["привязан"]])
+                await asyncio.to_thread(worksheet.update, f"E{row_index}", [[found_in]])
+                await asyncio.to_thread(worksheet.update, f"F{row_index}", [[region]])
                 await message.answer("✅ Вы успешно привязаны! Данные обновлены.")
             else:
-                # Добавляем новую строку (ровно 6 столбцов)
-                await async_append_row(worksheet, [
-                    phone_norm,          # A — номер
-                    message.chat.id,     # B — telegram_id
-                    client_name,         # C — ФИО
-                    "привязан",          # D — статус
-                    found_in,            # E — где нашел
-                    region               # F — область
+                await asyncio.to_thread(worksheet.append_row, [
+                    phone_norm, message.chat.id, client_name, "привязан", found_in, region
                 ])
                 await message.answer("✅ Вы успешно привязаны!")
         else:
@@ -146,7 +137,9 @@ async def sync_clients(message: Message):
         values = await asyncio.to_thread(clients.get_all_values)
         existing = {normalize_phone(row[0]) for row in values[1:] if row and len(row) > 0 and row[0]}
 
+        new_rows = []   # ← ВСЁ собираем сюда
         added = 0
+
         for idx, sid in enumerate(MANAGER_SHEETS, 1):
             await message.answer(f"→ Проверяю таблицу менеджера {idx}/7...")
             try:
@@ -164,7 +157,7 @@ async def sync_clients(message: Message):
                     phone_norm = normalize_phone(phone_raw)
                     if not phone_norm or phone_norm in existing: continue
 
-                    await async_append_row(clients, [
+                    new_rows.append([
                         phone_norm,          # A
                         "",                  # B
                         client_name,         # C — ФИО
@@ -180,8 +173,13 @@ async def sync_clients(message: Message):
                 await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:150]}")
                 continue
 
-        await message.answer(f"✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА! Добавлено новых клиентов: {added}")
-        
+        # ОДНА пакетная вставка — больше никаких 429!
+        if new_rows:
+            await async_append_rows(clients, new_rows)
+            await message.answer(f"✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА! Добавлено новых клиентов: {added}")
+        else:
+            await message.answer("✅ Всё уже синхронизировано, новых клиентов нет.")
+
     except Exception as e:
         print(f"CRITICAL SYNC ERROR: {e}")
         await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
@@ -255,7 +253,7 @@ async def main():
         return
     
     dp.startup.register(on_startup)
-    print("✅ Бот запущен | Новая структура Clients (6 столбцов)")
+    print("✅ Бот запущен | /sync теперь использует batch-запись (без 429)")
     
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
