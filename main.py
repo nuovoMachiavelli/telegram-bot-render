@@ -64,7 +64,7 @@ async def error_handler(event: aiogram_types.ErrorEvent):
     except:
         pass
 
-# ================= АВТОПРИВЯЗКА (без изменений) =================
+# ================= АВТОПРИВЯЗКА =================
 async def process_phone(phone_norm: str, message: Message):
     print(f"\n=== DEBUG ПРИВЯЗКА ===\nНомер: {phone_norm} | Chat ID: {message.chat.id}")
     try:
@@ -72,6 +72,7 @@ async def process_phone(phone_norm: str, message: Message):
         clients = await async_worksheet(spreadsheet, "Clients")
         clients_values = await asyncio.to_thread(clients.get_all_values)
 
+        # Поиск в таблицах менеджеров
         found_in = None
         region = ""
         client_name = ""
@@ -91,6 +92,7 @@ async def process_phone(phone_norm: str, message: Message):
             except:
                 continue
 
+        # Поиск в Clients
         row_index = None
         for i, row in enumerate(clients_values[1:], start=2):
             if isinstance(row, (list, tuple)) and len(row) > 0 and normalize_phone(row[0]) == phone_norm:
@@ -120,21 +122,29 @@ async def process_phone(phone_norm: str, message: Message):
         print(f"CRITICAL ERROR в process_phone: {e}")
         await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= /sync с статистикой (без изменений) =================
+# ================= УМНЫЙ /sync — ОБНОВЛЯЕТ ФИО =================
 @dp.message(Command("sync"))
 async def sync_clients(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещён.")
         return
-    await message.answer("🔄 Запускаю синхронизацию...")
+
+    await message.answer("🔄 Запускаю умную синхронизацию...")
+
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         clients = await async_worksheet(spreadsheet, "Clients")
         values = await asyncio.to_thread(clients.get_all_values)
-        existing = {normalize_phone(row[0]) for row in values[1:] 
-                   if isinstance(row, (list, tuple)) and len(row) > 0}
+
+        existing = {}
+        for i, row in enumerate(values[1:], start=2):
+            if isinstance(row, (list, tuple)) and len(row) > 0:
+                phone_norm = normalize_phone(row[0])
+                if phone_norm:
+                    existing[phone_norm] = i
 
         new_rows = []
+        updated = 0
         added = 0
 
         for idx, sid in enumerate(MANAGER_SHEETS, 1):
@@ -143,16 +153,28 @@ async def sync_clients(message: Message):
                 s = await async_open(sid)
                 sheet = await async_worksheet(s, "Общий")
                 data = await asyncio.to_thread(sheet.get_all_values)
+
                 for row in data[1:]:
                     if not isinstance(row, (list, tuple)) or len(row) < 6: continue
+                    
                     phone_raw   = str(row[4]) if len(row) > 4 else ""
                     region      = str(row[1]).strip() if len(row) > 1 else ""
                     client_name = str(row[5]).strip() if len(row) > 5 else ""
+
                     phone_norm = normalize_phone(phone_raw)
-                    if not phone_norm or phone_norm in existing: continue
-                    new_rows.append([phone_norm, "", client_name, "не привязан", f"Таблица {idx}", region])
-                    existing.add(phone_norm)
-                    added += 1
+                    if not phone_norm: continue
+
+                    if phone_norm in existing:
+                        row_index = existing[phone_norm]
+                        await asyncio.gather(
+                            asyncio.to_thread(clients.update, f"C{row_index}", [[client_name]]),
+                            asyncio.to_thread(clients.update, f"E{row_index}", [[f"Таблица {idx}"]]),
+                            asyncio.to_thread(clients.update, f"F{row_index}", [[region]])
+                        )
+                        updated += 1
+                    else:
+                        new_rows.append([phone_norm, "", client_name, "не привязан", f"Таблица {idx}", region])
+                        added += 1
             except Exception as e:
                 await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:100]}")
                 continue
@@ -160,29 +182,23 @@ async def sync_clients(message: Message):
         if new_rows:
             await async_append_rows(clients, new_rows)
 
-        fresh = await asyncio.to_thread(clients.get_all_values)
-        total = len(fresh) - 1
-        bound = sum(1 for row in fresh[1:] if isinstance(row, (list, tuple)) and len(row) > 1 and str(row[1]).strip() not in ("", "0"))
-        unbound = total - bound
-
-        await message.answer(f"""✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!
+        await message.answer(f"""✅ УМНАЯ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!
 
 Добавлено новых: {added}
-Всего клиентов: {total}
-Привязано: {bound}
-Не привязано: {unbound}""")
+Обновлено ФИО/регион/источник: {updated}""")
+
     except Exception as e:
         print(f"CRITICAL SYNC ERROR: {e}")
         await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
 
-# ================= ИСПРАВЛЕННАЯ РАССЫЛКА С ПОДРОБНОЙ ОТЛАДКОЙ =================
+# ================= РАБОЧАЯ РАССЫЛКА =================
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещён.")
         return
 
-    await message.answer("🚀 Запускаю рассылку... Смотри логи в консоли!")
+    await message.answer("🚀 Запускаю рассылку...")
 
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
@@ -192,7 +208,6 @@ async def broadcast_cmd(message: Message):
         data = await asyncio.to_thread(rassylka.get_all_values)
         clients_data = await asyncio.to_thread(clients_sheet.get_all_values)
 
-        # Создаём словарь телефон → TG ID
         phone_to_tg = {}
         for row in clients_data[1:]:
             if isinstance(row, (list, tuple)) and len(row) > 1:
@@ -202,39 +217,27 @@ async def broadcast_cmd(message: Message):
                     if tg_id and tg_id != "0":
                         phone_to_tg[phone_norm] = tg_id
 
-        print(f"DEBUG BROADCAST: Загружено строк в Рассылка: {len(data)}")
-        print(f"DEBUG BROADCAST: Клиентов с TG ID: {len(phone_to_tg)}")
-
         sent = 0
         skipped = 0
         errors = 0
-        processed = 0
 
         for i, row in enumerate(data[1:], start=2):
-            if not isinstance(row, (list, tuple)) or len(row) < 9:
-                continue
+            if not isinstance(row, (list, tuple)) or len(row) < 9: continue
 
             status = str(row[8]).strip().lower() if len(row) > 8 else ""
-            if status not in ("новый", ""):
-                continue
+            if status not in ("новый", ""): continue
 
-            processed += 1
             phone_raw   = str(row[2]) if len(row) > 2 else ""
-            phone_norm  = normalize_phone(phone_raw)
             shop_number = str(row[4]).strip() if len(row) > 4 else "—"
             amount      = str(row[5]).strip() if len(row) > 5 else "—"
             link        = str(row[6]).strip() if len(row) > 6 else ""
             period      = str(row[7]).strip() if len(row) > 7 else "—"
 
-            print(f"DEBUG: Строка {i} | статус='{status}' | телефон='{phone_raw}' → norm='{phone_norm}'")
-
-            if not phone_norm:
-                await asyncio.to_thread(rassylka.update, f"I{i}", [["ошибка: нет номера"]])
-                continue
+            phone_norm = normalize_phone(phone_raw)
+            if not phone_norm: continue
 
             tg_id = phone_to_tg.get(phone_norm)
             if not tg_id:
-                print(f"DEBUG: Строка {i} — НЕТ Telegram ID для телефона {phone_norm}")
                 await asyncio.to_thread(rassylka.update, f"I{i}", [["нет Telegram ID"]])
                 skipped += 1
                 continue
@@ -253,19 +256,16 @@ async def broadcast_cmd(message: Message):
                     asyncio.to_thread(rassylka.update, f"J{i}", [[now]])
                 )
                 sent += 1
-                print(f"DEBUG: УСПЕШНО отправлено → {phone_norm}")
                 await asyncio.sleep(2.0)
             except Exception as e:
-                err = str(e)[:80]
-                print(f"DEBUG: ОШИБКА отправки {phone_norm}: {err}")
-                await asyncio.to_thread(rassylka.update, f"I{i}", [[f"ошибка: {err}"]])
+                err_text = str(e)[:80]
+                await asyncio.to_thread(rassylka.update, f"I{i}", [[f"ошибка: {err_text}"]])
                 errors += 1
 
         await message.answer(f"""🎉 РАССЫЛКА ЗАВЕРШЕНА!
 ✅ Отправлено: {sent}
 ⏭ Пропущено: {skipped}
-❌ Ошибок: {errors}
-📋 Обработано строк со статусом «новый»: {processed}""")
+❌ Ошибок: {errors}""")
 
     except Exception as e:
         print(f"CRITICAL BROADCAST ERROR: {e}")
@@ -300,13 +300,12 @@ async def on_startup(bot: Bot):
     await bot.set_webhook(f"{BASE_WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}")
     print(f"✅ Webhook установлен")
 
-
 async def main():
     if not BASE_WEBHOOK_URL:
         print("❌ Укажи BASE_WEBHOOK_URL!")
         return
     dp.startup.register(on_startup)
-    print("✅ Бот запущен | Рассылка с полной отладкой")
+    print("✅ Бот запущен | /sync теперь обновляет ФИО + рассылка работает")
     
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
@@ -318,7 +317,6 @@ async def main():
     site = web.TCPSite(runner, host=WEBAPP_HOST, port=WEBAPP_PORT)
     await site.start()
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
