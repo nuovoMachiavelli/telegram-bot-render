@@ -51,10 +51,9 @@ async def async_open(spreadsheet_id):
 async def async_worksheet(spreadsheet, title):
     return await asyncio.to_thread(spreadsheet.worksheet, title)
 
-async def async_append_rows(worksheet, rows_list):          # ← НОВОЕ: пакетная вставка
-    return await asyncio.to_thread(
-        worksheet.append_rows, rows_list, value_input_option="RAW"
-    )
+async def async_append_rows(worksheet, rows_list):
+    if not rows_list: return
+    return await asyncio.to_thread(worksheet.append_rows, rows_list, value_input_option="RAW")
 
 # ================= ОБРАБОТЧИК ОШИБОК =================
 @dp.error()
@@ -104,11 +103,12 @@ async def process_phone(phone_norm: str, message: Message):
 
         if found_in:
             if row_index:
-                await asyncio.to_thread(worksheet.update, f"B{row_index}", [[message.chat.id]])
-                await asyncio.to_thread(worksheet.update, f"C{row_index}", [[client_name]])
-                await asyncio.to_thread(worksheet.update, f"D{row_index}", [["привязан"]])
-                await asyncio.to_thread(worksheet.update, f"E{row_index}", [[found_in]])
-                await asyncio.to_thread(worksheet.update, f"F{row_index}", [[region]])
+                await asyncio.gather(
+                    asyncio.to_thread(worksheet.update, f"C{row_index}", [[client_name]]),
+                    asyncio.to_thread(worksheet.update, f"F{row_index}", [[region]]),
+                    asyncio.to_thread(worksheet.update, f"E{row_index}", [[found_in]]),
+                    asyncio.to_thread(worksheet.update, f"D{row_index}", [["привязан"]])
+                )
                 await message.answer("✅ Вы успешно привязаны! Данные обновлены.")
             else:
                 await asyncio.to_thread(worksheet.append_row, [
@@ -121,7 +121,7 @@ async def process_phone(phone_norm: str, message: Message):
         print(f"CRITICAL ERROR в process_phone: {e}")
         await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= АДМИН КОМАНДЫ =================
+# ================= УМНЫЙ SYNC (не сбивает привязку) =================
 @dp.message(Command("sync"))
 async def sync_clients(message: Message):
     print(f"DEBUG: /sync от {message.from_user.id}")
@@ -129,15 +129,22 @@ async def sync_clients(message: Message):
         await message.answer("Доступ запрещён.")
         return
 
-    await message.answer("🔄 Запускаю синхронизацию...")
+    await message.answer("🔄 Запускаю умную синхронизацию...")
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         clients = await async_worksheet(spreadsheet, "Clients")
         
         values = await asyncio.to_thread(clients.get_all_values)
-        existing = {normalize_phone(row[0]) for row in values[1:] if row and len(row) > 0 and row[0]}
+        existing = {}
+        for i, row in enumerate(values[1:], start=2):
+            if not row or len(row) < 1: continue
+            phone_norm = normalize_phone(row[0])
+            if phone_norm:
+                tg_id = str(row[1]).strip() if len(row) > 1 else ""
+                existing[phone_norm] = {'index': i, 'has_tg': bool(tg_id and tg_id != "0")}
 
-        new_rows = []   # ← ВСЁ собираем сюда
+        new_rows = []
+        updated_count = 0
         added = 0
 
         for idx, sid in enumerate(MANAGER_SHEETS, 1):
@@ -155,36 +162,42 @@ async def sync_clients(message: Message):
                     client_name = str(row[5]).strip() if len(row) > 5 else ""
 
                     phone_norm = normalize_phone(phone_raw)
-                    if not phone_norm or phone_norm in existing: continue
+                    if not phone_norm: continue
 
-                    new_rows.append([
-                        phone_norm,          # A
-                        "",                  # B
-                        client_name,         # C — ФИО
-                        "не привязан",       # D
-                        f"Таблица {idx}",    # E
-                        region               # F
-                    ])
-                    
-                    existing.add(phone_norm)
-                    added += 1
-                    
+                    if phone_norm in existing:
+                        row_info = existing[phone_norm]
+                        updates = [
+                            {'range': f"C{row_info['index']}", 'values': [[client_name]]},
+                            {'range': f"F{row_info['index']}", 'values': [[region]]},
+                            {'range': f"E{row_info['index']}", 'values': [[f"Таблица {idx}"]]}
+                        ]
+                        if row_info['has_tg']:
+                            updates.append({'range': f"D{row_info['index']}", 'values': [["привязан"]]})
+                        
+                        await asyncio.to_thread(clients.batch_update, {"valueInputOption": "RAW", "data": updates})
+                        updated_count += 1
+                    else:
+                        new_rows.append([phone_norm, "", client_name, "не привязан", f"Таблица {idx}", region])
+                        existing[phone_norm] = {'index': 0, 'has_tg': False}
+                        added += 1
+                        
             except Exception as e:
-                await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:150]}")
+                await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:120]}")
                 continue
 
-        # ОДНА пакетная вставка — больше никаких 429!
         if new_rows:
             await async_append_rows(clients, new_rows)
-            await message.answer(f"✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА! Добавлено новых клиентов: {added}")
-        else:
-            await message.answer("✅ Всё уже синхронизировано, новых клиентов нет.")
+
+        await message.answer(f"""✅ УМНАЯ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!
+Добавлено новых: {added}
+Обновлено существующих: {updated_count}""")
 
     except Exception as e:
         print(f"CRITICAL SYNC ERROR: {e}")
         await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
 
 
+# ================= ОСТАЛЬНОЕ (без изменений) =================
 @dp.message(Command("stats"))
 async def stats(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -209,7 +222,6 @@ async def broadcast_cmd(message: Message):
     await message.answer("✅ Рассылка готова (заглушка)")
 
 
-# ================= ОБЫЧНЫЕ ХЕНДЛЕРЫ =================
 @dp.message(Command("start"))
 async def start(message: Message):
     kb = ReplyKeyboardMarkup(
@@ -244,16 +256,15 @@ async def on_startup(bot: Bot):
     )
     gc = gspread.authorize(creds)
     await bot.set_webhook(f"{BASE_WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}")
-    print(f"✅ Webhook установлен: {BASE_WEBHOOK_URL}{WEBHOOK_PATH}")
+    print(f"✅ Webhook установлен")
 
 
 async def main():
     if not BASE_WEBHOOK_URL:
         print("❌ Укажи BASE_WEBHOOK_URL!")
         return
-    
     dp.startup.register(on_startup)
-    print("✅ Бот запущен | /sync теперь использует batch-запись (без 429)")
+    print("✅ Бот запущен | Умный /sync активирован (привязка больше не теряется)")
     
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
