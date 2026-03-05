@@ -64,66 +64,138 @@ async def error_handler(event: aiogram_types.ErrorEvent):
     except:
         pass
 
-# ================= ПРИВЯЗКА НОМЕРА (ИСПРАВЛЕНО: telegram_id теперь всегда пишется) =================
+# ================= АВТОПРИВЯЗКА ИЗ ТАБЛИЦ МЕНЕДЖЕРОВ =================
 async def process_phone(phone_norm: str, message: Message):
-    print(f"DEBUG: Обработка номера {phone_norm}")
+    print(f"\n=== DEBUG ПРИВЯЗКА ===\nНомер: {phone_norm} | Chat ID: {message.chat.id}")
+
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
-        worksheet = await async_worksheet(spreadsheet, "Clients")
-        values = await asyncio.to_thread(worksheet.get_all_values)
+        clients = await async_worksheet(spreadsheet, "Clients")
+        clients_values = await asyncio.to_thread(clients.get_all_values)
 
-        row_index = None
-        for i, row in enumerate(values[1:], start=2):
-            if isinstance(row, (list, tuple)) and len(row) > 0 and normalize_phone(row[0]) == phone_norm:
-                row_index = i
-                break
-
+        # Ищем в таблицах менеджеров
         found_in = None
         region = ""
         client_name = ""
-
         for idx, sid in enumerate(MANAGER_SHEETS, 1):
             try:
                 s = await async_open(sid)
                 sheet = await async_worksheet(s, "Общий")
-                col_e = await asyncio.to_thread(sheet.col_values, 5)
-                col_b = await asyncio.to_thread(sheet.col_values, 2)
-                col_f = await asyncio.to_thread(sheet.col_values, 6)
-
-                for j in range(min(len(col_e), len(col_b), len(col_f))):
-                    if normalize_phone(col_e[j]) == phone_norm:
+                data = await asyncio.to_thread(sheet.get_all_values)
+                for row in data[1:]:
+                    if not isinstance(row, (list, tuple)) or len(row) < 6: continue
+                    if normalize_phone(row[4] if len(row) > 4 else "") == phone_norm:
                         found_in = f"Таблица {idx}"
-                        region = str(col_b[j]).strip()
-                        client_name = str(col_f[j]).strip()
+                        region = str(row[1]).strip() if len(row) > 1 else ""
+                        client_name = str(row[5]).strip() if len(row) > 5 else ""
                         break
                 if found_in: break
-            except Exception as e:
-                print(f"Ошибка в таблице менеджера {idx}: {e}")
+            except:
                 continue
+
+        # Ищем строку в Clients
+        row_index = None
+        for i, row in enumerate(clients_values[1:], start=2):
+            if isinstance(row, (list, tuple)) and len(row) > 0 and normalize_phone(row[0]) == phone_norm:
+                row_index = i
+                break
 
         if found_in:
             if row_index:
-                # ← ИСПРАВЛЕНИЕ: теперь обновляем и telegram_id в столбце B
                 await asyncio.gather(
-                    asyncio.to_thread(worksheet.update, f"B{row_index}", [[message.chat.id]]),
-                    asyncio.to_thread(worksheet.update, f"C{row_index}", [[client_name]]),
-                    asyncio.to_thread(worksheet.update, f"D{row_index}", [["привязан"]]),
-                    asyncio.to_thread(worksheet.update, f"E{row_index}", [[found_in]]),
-                    asyncio.to_thread(worksheet.update, f"F{row_index}", [[region]])
+                    asyncio.to_thread(clients.update, f"B{row_index}", [[message.chat.id]]),
+                    asyncio.to_thread(clients.update, f"C{row_index}", [[client_name]]),
+                    asyncio.to_thread(clients.update, f"D{row_index}", [["привязан"]]),
+                    asyncio.to_thread(clients.update, f"E{row_index}", [[found_in]]),
+                    asyncio.to_thread(clients.update, f"F{row_index}", [[region]])
                 )
-                await message.answer("✅ Вы успешно привязаны! Telegram ID и данные обновлены.")
+                await message.answer("✅ Вы успешно привязаны! Данные обновлены.")
             else:
-                await asyncio.to_thread(worksheet.append_row, [
+                await asyncio.to_thread(clients.append_row, [
                     phone_norm, message.chat.id, client_name, "привязан", found_in, region
                 ])
                 await message.answer("✅ Вы успешно привязаны!")
-        else:
-            await message.answer("❌ К сожалению, ваш номер не найден в базе.")
+            return
+
+        await message.answer("❌ К сожалению, ваш номер не найден в базе.")
+
     except Exception as e:
         print(f"CRITICAL ERROR в process_phone: {e}")
         await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= РАССЫЛКА (работает как раньше) =================
+# ================= УЛУЧШЕННЫЙ /sync (теперь показывает статистику привязки) =================
+@dp.message(Command("sync"))
+async def sync_clients(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Доступ запрещён.")
+        return
+
+    await message.answer("🔄 Запускаю синхронизацию...")
+    try:
+        spreadsheet = await async_open(MAIN_SHEET_ID)
+        clients = await async_worksheet(spreadsheet, "Clients")
+        values = await asyncio.to_thread(clients.get_all_values)
+
+        existing = {normalize_phone(row[0]) for row in values[1:] 
+                   if isinstance(row, (list, tuple)) and len(row) > 0}
+
+        new_rows = []
+        added = 0
+
+        for idx, sid in enumerate(MANAGER_SHEETS, 1):
+            await message.answer(f"→ Проверяю таблицу менеджера {idx}/7...")
+            try:
+                s = await async_open(sid)
+                sheet = await async_worksheet(s, "Общий")
+                data = await asyncio.to_thread(sheet.get_all_values)
+
+                for row in data[1:]:
+                    if not isinstance(row, (list, tuple)) or len(row) < 6: continue
+                    
+                    phone_raw   = str(row[4]) if len(row) > 4 else ""
+                    region      = str(row[1]).strip() if len(row) > 1 else ""
+                    client_name = str(row[5]).strip() if len(row) > 5 else ""
+
+                    phone_norm = normalize_phone(phone_raw)
+                    if not phone_norm or phone_norm in existing: continue
+
+                    new_rows.append([phone_norm, "", client_name, "не привязан", f"Таблица {idx}", region])
+                    existing.add(phone_norm)
+                    added += 1
+                    
+            except Exception as e:
+                await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:100]}")
+                continue
+
+        if new_rows:
+            await async_append_rows(clients, new_rows)
+
+        # === НОВАЯ СТАТИСТИКА ===
+        fresh_values = await asyncio.to_thread(clients.get_all_values)
+        total = len(fresh_values) - 1 if len(fresh_values) > 0 else 0
+        bound = 0
+        unbound = 0
+        for row in fresh_values[1:]:
+            if isinstance(row, (list, tuple)) and len(row) > 1:
+                tg_id = str(row[1]).strip()
+                if tg_id and tg_id != "0":
+                    bound += 1
+                else:
+                    unbound += 1
+
+        await message.answer(f"""✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!
+
+Добавлено новых клиентов: {added}
+Всего клиентов: {total}
+Привязано (есть Telegram ID): {bound}
+Не привязано: {unbound}""")
+
+    except Exception as e:
+        print(f"CRITICAL SYNC ERROR: {e}")
+        await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
+
+
+# ================= РАССЫЛКА И ОСТАЛЬНОЕ (без изменений) =================
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -202,65 +274,12 @@ async def broadcast_cmd(message: Message):
 
         await message.answer(f"""🎉 РАССЫЛКА ЗАВЕРШЕНА!
 ✅ Отправлено: {sent}
-⏭ Пропущено (нет TG): {skipped}
+⏭ Пропущено: {skipped}
 ❌ Ошибок: {errors}""")
 
     except Exception as e:
         print(f"CRITICAL BROADCAST ERROR: {e}")
         await message.answer(f"❌ Критическая ошибка рассылки: {str(e)}")
-
-
-# ================= sync, stats, start и т.д. (без изменений) =================
-@dp.message(Command("sync"))
-async def sync_clients(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Доступ запрещён.")
-        return
-    await message.answer("🔄 Запускаю синхронизацию (только новые клиенты)...")
-    try:
-        spreadsheet = await async_open(MAIN_SHEET_ID)
-        clients = await async_worksheet(spreadsheet, "Clients")
-        values = await asyncio.to_thread(clients.get_all_values)
-        existing = {normalize_phone(row[0]) for row in values[1:] 
-                   if isinstance(row, (list, tuple)) and len(row) > 0}
-
-        new_rows = []
-        added = 0
-
-        for idx, sid in enumerate(MANAGER_SHEETS, 1):
-            await message.answer(f"→ Проверяю таблицу менеджера {idx}/7...")
-            try:
-                s = await async_open(sid)
-                sheet = await async_worksheet(s, "Общий")
-                data = await asyncio.to_thread(sheet.get_all_values)
-
-                for row in data[1:]:
-                    if not isinstance(row, (list, tuple)) or len(row) < 6: continue
-                    
-                    phone_raw   = str(row[4]) if len(row) > 4 else ""
-                    region      = str(row[1]).strip() if len(row) > 1 else ""
-                    client_name = str(row[5]).strip() if len(row) > 5 else ""
-
-                    phone_norm = normalize_phone(phone_raw)
-                    if not phone_norm or phone_norm in existing: continue
-
-                    new_rows.append([phone_norm, "", client_name, "не привязан", f"Таблица {idx}", region])
-                    existing.add(phone_norm)
-                    added += 1
-                    
-            except Exception as e:
-                await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:100]}")
-                continue
-
-        if new_rows:
-            await async_append_rows(clients, new_rows)
-            await message.answer(f"✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА! Добавлено новых клиентов: {added}")
-        else:
-            await message.answer("✅ Всё уже синхронизировано, новых клиентов нет.")
-
-    except Exception as e:
-        print(f"CRITICAL SYNC ERROR: {e}")
-        await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
 
 
 @dp.message(Command("stats"))
@@ -273,7 +292,7 @@ async def stats(message: Message):
         clients = await async_worksheet(spreadsheet, "Clients")
         data = await asyncio.to_thread(clients.get_all_records)
         total = len(data)
-        bound = sum(1 for row in data if str(row.get("status", "")).lower() == "привязан")
+        bound = sum(1 for row in data if str(row.get("telegram_id", "")).strip() not in ("", "0"))
         await message.answer(f"📊 Всего клиентов: {total} | Привязано: {bound}")
     except Exception as e:
         await message.answer(f"❌ Ошибка stats: {str(e)}")
@@ -321,7 +340,7 @@ async def main():
         print("❌ Укажи BASE_WEBHOOK_URL!")
         return
     dp.startup.register(on_startup)
-    print("✅ Бот запущен | Telegram ID теперь всегда записывается при привязке")
+    print("✅ Бот запущен | /sync теперь показывает статистику привязки")
     
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
