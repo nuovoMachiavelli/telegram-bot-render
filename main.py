@@ -171,7 +171,8 @@ async def sync_clients(message: Message):
         if batch_updates:
             await asyncio.to_thread(
                 clients.batch_update,
-                {"valueInputOption": "RAW", "data": batch_updates}
+                batch_updates,
+                value_input_option="RAW"
             )
 
         if new_rows:
