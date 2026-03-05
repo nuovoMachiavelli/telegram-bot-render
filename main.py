@@ -67,16 +67,16 @@ async def async_append_row(worksheet, row):
 async def async_update(worksheet, range_name, values):
     return await asyncio.to_thread(worksheet.update, range_name, values)
 
-# ================= ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК =================
+# ================= ОБРАБОТЧИК ОШИБОК =================
 @dp.error()
 async def error_handler(event: aiogram_types.ErrorEvent):
     print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {event.exception}")
     try:
-        await event.update.message.answer("❌ Произошла ошибка. Админ уже в курсе.")
+        await event.update.message.answer("❌ Произошла ошибка.")
     except:
         pass
 
-# ================= ПРИВЯЗКА НОМЕРА =================
+# ================= ПРИВЯЗКА НОМЕРА (с новым столбцом username из F) =================
 async def process_phone(phone_norm: str, message: Message):
     print(f"DEBUG: Обработка номера {phone_norm}")
     try:
@@ -92,16 +92,20 @@ async def process_phone(phone_norm: str, message: Message):
 
         found_in = None
         region = ""
+        client_name = ""                    # ← НОВОЕ: имя из столбца F
         for idx, sid in enumerate(MANAGER_SHEETS, 1):
             try:
                 s = await async_open(sid)
                 sheet = await async_worksheet(s, "Общий")
-                col_e = await async_col_values(sheet, 5)
-                col_b = await async_col_values(sheet, 2)
-                for j in range(min(len(col_e), len(col_b))):
+                col_e = await async_col_values(sheet, 5)   # телефон
+                col_b = await async_col_values(sheet, 2)   # регион
+                col_f = await async_col_values(sheet, 6)   # ← ИМЯ (столбец F)
+
+                for j in range(min(len(col_e), len(col_b), len(col_f))):
                     if normalize_phone(col_e[j]) == phone_norm:
                         found_in = f"Таблица {idx}"
                         region = str(col_b[j]).strip()
+                        client_name = str(col_f[j]).strip()   # ← БЕРЁМ ИМЯ ИЗ F
                         break
                 if found_in: break
             except Exception as e:
@@ -110,15 +114,18 @@ async def process_phone(phone_norm: str, message: Message):
 
         if found_in:
             if row_index:
+                # Обновляем всё, включая имя из F
                 await async_update(worksheet, f"B{row_index}", [[message.chat.id]])
+                await async_update(worksheet, f"C{row_index}", [[client_name]])   # ← username
                 await async_update(worksheet, f"F{row_index}", [["привязан"]])
                 await async_update(worksheet, f"G{row_index}", [[found_in]])
                 await async_update(worksheet, f"H{row_index}", [[region]])
-                await message.answer("✅ Вы успешно привязаны! Telegram ID обновлён.")
+                await message.answer("✅ Вы успешно привязаны! Telegram ID и имя обновлены.")
             else:
                 await async_append_row(worksheet, [
-                    phone_norm, message.chat.id, message.from_user.username or "",
-                    message.from_user.full_name, datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    phone_norm, message.chat.id, client_name,          # ← username из F
+                    message.from_user.full_name,
+                    datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "привязан", found_in, region
                 ])
                 await message.answer("✅ Вы успешно привязаны!")
@@ -128,7 +135,7 @@ async def process_phone(phone_norm: str, message: Message):
         print(f"CRITICAL ERROR в process_phone: {e}")
         await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= АДМИН КОМАНДЫ (с правильными отступами) =================
+# ================= АДМИН КОМАНДЫ =================
 @dp.message(Command("sync"))
 async def sync_clients(message: Message):
     print(f"DEBUG: /sync от {message.from_user.id}")
@@ -149,13 +156,16 @@ async def sync_clients(message: Message):
                 sheet = await async_worksheet(s, "Общий")
                 phones = await async_col_values(sheet, 5)
                 regions = await async_col_values(sheet, 2)
+                names = await async_col_values(sheet, 6)          # ← ИМЯ ИЗ F
+
                 for i in range(1, len(phones)):
                     phone_norm = normalize_phone(phones[i])
-                    if not phone_norm or phone_norm in existing:
-                        continue
+                    if not phone_norm or phone_norm in existing: continue
                     region = regions[i] if i < len(regions) else ""
+                    client_name = str(names[i]).strip() if i < len(names) else ""   # ← БЕРЁМ ИЗ F
                     await async_append_row(clients, [
-                        phone_norm, "", "", "", datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        phone_norm, "", client_name, "",               # ← username из F
+                        datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "не привязан", f"Таблица {idx}", region
                     ])
                     existing.add(phone_norm)
@@ -223,7 +233,7 @@ async def main():
         print("❌ Укажи BASE_WEBHOOK_URL!")
         return
     dp.startup.register(on_startup)
-    print("✅ Бот запущен на Render (исправленная версия)")
+    print("✅ Бот запущен на Render (username из столбца F добавлен)")
 
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
