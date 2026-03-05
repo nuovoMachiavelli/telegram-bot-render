@@ -67,13 +67,12 @@ async def error_handler(event: aiogram_types.ErrorEvent):
 # ================= АВТОПРИВЯЗКА ИЗ ТАБЛИЦ МЕНЕДЖЕРОВ =================
 async def process_phone(phone_norm: str, message: Message):
     print(f"\n=== DEBUG ПРИВЯЗКА ===\nНомер: {phone_norm} | Chat ID: {message.chat.id}")
-
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         clients = await async_worksheet(spreadsheet, "Clients")
         clients_values = await asyncio.to_thread(clients.get_all_values)
 
-        # Ищем в таблицах менеджеров
+        # Поиск в таблицах менеджеров
         found_in = None
         region = ""
         client_name = ""
@@ -93,7 +92,7 @@ async def process_phone(phone_norm: str, message: Message):
             except:
                 continue
 
-        # Ищем строку в Clients
+        # Поиск строки в Clients
         row_index = None
         for i, row in enumerate(clients_values[1:], start=2):
             if isinstance(row, (list, tuple)) and len(row) > 0 and normalize_phone(row[0]) == phone_norm:
@@ -117,13 +116,13 @@ async def process_phone(phone_norm: str, message: Message):
                 await message.answer("✅ Вы успешно привязаны!")
             return
 
-        await message.answer("❌ К сожалению, ваш номер не найден в базе.")
+        await message.answer("❌ К сожалению, ваш номер не найден в базе, обратитесь к менеджеру")
 
     except Exception as e:
         print(f"CRITICAL ERROR в process_phone: {e}")
         await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= УЛУЧШЕННЫЙ /sync (теперь показывает статистику привязки) =================
+# ================= УЛУЧШЕННЫЙ /sync С ПОЛНОЙ СТАТИСТИКОЙ =================
 @dp.message(Command("sync"))
 async def sync_clients(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -170,32 +169,24 @@ async def sync_clients(message: Message):
         if new_rows:
             await async_append_rows(clients, new_rows)
 
-        # === НОВАЯ СТАТИСТИКА ===
-        fresh_values = await asyncio.to_thread(clients.get_all_values)
-        total = len(fresh_values) - 1 if len(fresh_values) > 0 else 0
-        bound = 0
-        unbound = 0
-        for row in fresh_values[1:]:
-            if isinstance(row, (list, tuple)) and len(row) > 1:
-                tg_id = str(row[1]).strip()
-                if tg_id and tg_id != "0":
-                    bound += 1
-                else:
-                    unbound += 1
+        # === СТАТИСТИКА ===
+        fresh = await asyncio.to_thread(clients.get_all_values)
+        total = len(fresh) - 1
+        bound = sum(1 for row in fresh[1:] if isinstance(row, (list, tuple)) and len(row) > 1 and str(row[1]).strip() not in ("", "0"))
+        unbound = total - bound
 
         await message.answer(f"""✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!
 
-Добавлено новых клиентов: {added}
+Добавлено новых: {added}
 Всего клиентов: {total}
-Привязано (есть Telegram ID): {bound}
+Привязано: {bound}
 Не привязано: {unbound}""")
 
     except Exception as e:
         print(f"CRITICAL SYNC ERROR: {e}")
         await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
 
-
-# ================= РАССЫЛКА И ОСТАЛЬНОЕ (без изменений) =================
+# ================= РАБОЧАЯ РАССЫЛКА (точно как раньше) =================
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -247,7 +238,7 @@ async def broadcast_cmd(message: Message):
                 continue
 
             text = f"""Оплата за магазин {shop_number}
-Сумма {amount}
+Сумма ₽ {amount}
 За период {period}
 
 {link}"""
@@ -282,38 +273,17 @@ async def broadcast_cmd(message: Message):
         await message.answer(f"❌ Критическая ошибка рассылки: {str(e)}")
 
 
-@dp.message(Command("stats"))
-async def stats(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Доступ запрещён.")
-        return
-    try:
-        spreadsheet = await async_open(MAIN_SHEET_ID)
-        clients = await async_worksheet(spreadsheet, "Clients")
-        data = await asyncio.to_thread(clients.get_all_records)
-        total = len(data)
-        bound = sum(1 for row in data if str(row.get("telegram_id", "")).strip() not in ("", "0"))
-        await message.answer(f"📊 Всего клиентов: {total} | Привязано: {bound}")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка stats: {str(e)}")
-
-
+# ================= start, contact, manual =================
 @dp.message(Command("start"))
 async def start(message: Message):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
     await message.answer("Привет! Нажми кнопку или напиши номер цифрами.", reply_markup=kb)
-
 
 @dp.message(F.contact)
 async def handle_contact(message: Message):
     phone_norm = normalize_phone(message.contact.phone_number)
     if phone_norm:
         await process_phone(phone_norm, message)
-
 
 @dp.message(F.text & ~F.command)
 async def handle_manual_phone(message: Message):
@@ -326,10 +296,7 @@ async def handle_manual_phone(message: Message):
 # ================= ЗАПУСК =================
 async def on_startup(bot: Bot):
     global gc
-    creds = Credentials.from_service_account_info(
-        GOOGLE_CREDS,
-        scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    )
+    creds = Credentials.from_service_account_info(GOOGLE_CREDS, scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
     gc = gspread.authorize(creds)
     await bot.set_webhook(f"{BASE_WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}")
     print(f"✅ Webhook установлен")
@@ -340,7 +307,7 @@ async def main():
         print("❌ Укажи BASE_WEBHOOK_URL!")
         return
     dp.startup.register(on_startup)
-    print("✅ Бот запущен | /sync теперь показывает статистику привязки")
+    print("✅ Бот запущен | Рассылка восстановлена + /sync показывает статистику")
     
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
