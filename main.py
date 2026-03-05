@@ -67,11 +67,10 @@ async def async_append_row(worksheet, row):
 async def async_update(worksheet, range_name, values):
     return await asyncio.to_thread(worksheet.update, range_name, values)
 
-# ================= ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК (чтобы видеть что сломалось) =================
+# ================= ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК =================
 @dp.error()
 async def error_handler(event: aiogram_types.ErrorEvent):
     print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {event.exception}")
-    print(f"Update: {event.update}")
     try:
         await event.update.message.answer("❌ Произошла ошибка. Админ уже в курсе.")
     except:
@@ -79,7 +78,7 @@ async def error_handler(event: aiogram_types.ErrorEvent):
 
 # ================= ПРИВЯЗКА НОМЕРА =================
 async def process_phone(phone_norm: str, message: Message):
-    print(f"DEBUG: Обработка номера {phone_norm} от пользователя {message.from_user.id}")
+    print(f"DEBUG: Обработка номера {phone_norm}")
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         worksheet = await async_worksheet(spreadsheet, "Clients")
@@ -126,13 +125,13 @@ async def process_phone(phone_norm: str, message: Message):
         else:
             await message.answer("❌ К сожалению, ваш номер не найден в базе.")
     except Exception as e:
-        print(f"CRITICAL ERROR в process_phone: {type(e).__name__}: {e}")
-        await message.answer("❌ Ошибка при обработке номера. Попробуйте позже.")
+        print(f"CRITICAL ERROR в process_phone: {e}")
+        await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= АДМИН КОМАНДЫ =================
+# ================= АДМИН КОМАНДЫ (с правильными отступами) =================
 @dp.message(Command("sync"))
 async def sync_clients(message: Message):
-    print(f"DEBUG: /sync от {message.from_user.id} (ADMIN_ID={ADMIN_ID})")
+    print(f"DEBUG: /sync от {message.from_user.id}")
     if message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещён.")
         return
@@ -152,5 +151,90 @@ async def sync_clients(message: Message):
                 regions = await async_col_values(sheet, 2)
                 for i in range(1, len(phones)):
                     phone_norm = normalize_phone(phones[i])
-                    if not phone_norm or phone_norm in existing: continue
-                    region = regions[i]
+                    if not phone_norm or phone_norm in existing:
+                        continue
+                    region = regions[i] if i < len(regions) else ""
+                    await async_append_row(clients, [
+                        phone_norm, "", "", "", datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "не привязан", f"Таблица {idx}", region
+                    ])
+                    existing.add(phone_norm)
+                    added += 1
+            except Exception as e:
+                await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:100]}")
+                continue
+        await message.answer(f"✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА! Добавлено: {added}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
+
+@dp.message(Command("stats"))
+async def stats(message: Message):
+    print(f"DEBUG: /stats от {message.from_user.id}")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Доступ запрещён.")
+        return
+    try:
+        spreadsheet = await async_open(MAIN_SHEET_ID)
+        clients = await async_worksheet(spreadsheet, "Clients")
+        data = await async_get_all_records(clients)
+        total = len(data)
+        bound = sum(1 for row in data if str(row.get("status", "")).lower() == "привязан")
+        await message.answer(f"📊 Всего клиентов: {total} | Привязано: {bound}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка stats: {str(e)}")
+
+@dp.message(Command("broadcast"))
+async def broadcast_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Доступ запрещён.")
+        return
+    await message.answer("✅ Рассылка готова (заглушка)")
+
+# ================= ОБЫЧНЫЕ ХЕНДЛЕРЫ =================
+@dp.message(Command("start"))
+async def start(message: Message):
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
+    await message.answer("Привет! Нажми кнопку или напиши номер цифрами.", reply_markup=kb)
+
+@dp.message(F.contact)
+async def handle_contact(message: Message):
+    print("DEBUG: Получен контакт")
+    phone_norm = normalize_phone(message.contact.phone_number)
+    if phone_norm:
+        await process_phone(phone_norm, message)
+
+@dp.message(F.text & ~F.command)
+async def handle_manual_phone(message: Message):
+    phone_norm = normalize_phone(message.text)
+    if phone_norm:
+        await message.answer("🔍 Проверяю номер...")
+        await process_phone(phone_norm, message)
+
+# ================= ЗАПУСК =================
+async def on_startup(bot: Bot):
+    global gc
+    creds = Credentials.from_service_account_info(GOOGLE_CREDS, scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
+    gc = gspread.authorize(creds)
+    await bot.set_webhook(f"{BASE_WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}")
+    print(f"✅ Webhook установлен: {BASE_WEBHOOK_URL}{WEBHOOK_PATH}")
+
+async def main():
+    if not BASE_WEBHOOK_URL:
+        print("❌ Укажи BASE_WEBHOOK_URL!")
+        return
+    dp.startup.register(on_startup)
+    print("✅ Бот запущен на Render (исправленная версия)")
+
+    app = web.Application()
+    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+    webhook_handler.register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host=WEBAPP_HOST, port=WEBAPP_PORT)
+    await site.start()
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
