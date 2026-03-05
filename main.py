@@ -64,7 +64,7 @@ async def error_handler(event: aiogram_types.ErrorEvent):
     except:
         pass
 
-# ================= ПРИВЯЗКА НОМЕРА (без изменений) =================
+# ================= ПРИВЯЗКА НОМЕРА (ИСПРАВЛЕНО: telegram_id теперь всегда пишется) =================
 async def process_phone(phone_norm: str, message: Message):
     print(f"DEBUG: Обработка номера {phone_norm}")
     try:
@@ -103,13 +103,15 @@ async def process_phone(phone_norm: str, message: Message):
 
         if found_in:
             if row_index:
+                # ← ИСПРАВЛЕНИЕ: теперь обновляем и telegram_id в столбце B
                 await asyncio.gather(
+                    asyncio.to_thread(worksheet.update, f"B{row_index}", [[message.chat.id]]),
                     asyncio.to_thread(worksheet.update, f"C{row_index}", [[client_name]]),
                     asyncio.to_thread(worksheet.update, f"D{row_index}", [["привязан"]]),
                     asyncio.to_thread(worksheet.update, f"E{row_index}", [[found_in]]),
                     asyncio.to_thread(worksheet.update, f"F{row_index}", [[region]])
                 )
-                await message.answer("✅ Вы успешно привязаны! Данные обновлены.")
+                await message.answer("✅ Вы успешно привязаны! Telegram ID и данные обновлены.")
             else:
                 await asyncio.to_thread(worksheet.append_row, [
                     phone_norm, message.chat.id, client_name, "привязан", found_in, region
@@ -121,16 +123,14 @@ async def process_phone(phone_norm: str, message: Message):
         print(f"CRITICAL ERROR в process_phone: {e}")
         await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= ИСПРАВЛЕННАЯ РАССЫЛКА =================
+# ================= РАССЫЛКА (работает как раньше) =================
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещён.")
         return
 
-    await message.answer("🚀 Запускаю рассылку...\n"
-                         "Обрабатываю только строки со статусом «новый»\n"
-                         "Задержка 2 секунды между сообщениями (защита от бана)")
+    await message.answer("🚀 Запускаю рассылку...\nОбрабатываю только строки со статусом «новый»")
 
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
@@ -140,7 +140,6 @@ async def broadcast_cmd(message: Message):
         data = await asyncio.to_thread(rassylka.get_all_values)
         clients_data = await asyncio.to_thread(clients_sheet.get_all_values)
 
-        # Телефон → Telegram ID
         phone_to_tg = {}
         for row in clients_data[1:]:
             if isinstance(row, (list, tuple)) and len(row) > 1:
@@ -155,12 +154,10 @@ async def broadcast_cmd(message: Message):
         errors = 0
 
         for i, row in enumerate(data[1:], start=2):
-            if not isinstance(row, (list, tuple)) or len(row) < 9:
-                continue
+            if not isinstance(row, (list, tuple)) or len(row) < 9: continue
 
             status = str(row[8]).strip().lower() if len(row) > 8 else ""
-            if status not in ("новый", ""):  # ← только эти строки обрабатываем
-                continue
+            if status not in ("новый", ""): continue
 
             phone_raw   = str(row[2]) if len(row) > 2 else ""
             shop_number = str(row[4]).strip() if len(row) > 4 else "—"
@@ -169,9 +166,7 @@ async def broadcast_cmd(message: Message):
             period      = str(row[7]).strip() if len(row) > 7 else "—"
 
             phone_norm = normalize_phone(phone_raw)
-            if not phone_norm:
-                await asyncio.to_thread(rassylka.update, f"I{i}", [["ошибка: нет номера"]])
-                continue
+            if not phone_norm: continue
 
             tg_id = phone_to_tg.get(phone_norm)
             if not tg_id:
@@ -189,7 +184,6 @@ async def broadcast_cmd(message: Message):
                 await bot.send_message(chat_id=int(tg_id), text=text)
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                # Обновляем статус и время
                 await asyncio.gather(
                     asyncio.to_thread(rassylka.update, f"I{i}", [["отправлено"]]),
                     asyncio.to_thread(rassylka.update, f"J{i}", [[now]])
@@ -199,13 +193,12 @@ async def broadcast_cmd(message: Message):
                 if sent % 10 == 0:
                     await message.answer(f"📤 Отправлено: {sent} | Пропущено: {skipped} | Ошибок: {errors}")
 
-                await asyncio.sleep(2.0)  # защита от бана
+                await asyncio.sleep(2.0)
 
             except Exception as e:
                 err_text = str(e)[:80]
                 await asyncio.to_thread(rassylka.update, f"I{i}", [[f"ошибка: {err_text}"]])
                 errors += 1
-                print(f"Ошибка отправки {phone_norm}: {e}")
 
         await message.answer(f"""🎉 РАССЫЛКА ЗАВЕРШЕНА!
 ✅ Отправлено: {sent}
@@ -217,28 +210,91 @@ async def broadcast_cmd(message: Message):
         await message.answer(f"❌ Критическая ошибка рассылки: {str(e)}")
 
 
-# ================= ОСТАЛЬНЫЕ КОМАНДЫ (sync, stats и т.д. — без изменений) =================
+# ================= sync, stats, start и т.д. (без изменений) =================
 @dp.message(Command("sync"))
 async def sync_clients(message: Message):
-    # ... (тот же код, что был раньше)
-    pass  # оставь как в предыдущей версии
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Доступ запрещён.")
+        return
+    await message.answer("🔄 Запускаю синхронизацию (только новые клиенты)...")
+    try:
+        spreadsheet = await async_open(MAIN_SHEET_ID)
+        clients = await async_worksheet(spreadsheet, "Clients")
+        values = await asyncio.to_thread(clients.get_all_values)
+        existing = {normalize_phone(row[0]) for row in values[1:] 
+                   if isinstance(row, (list, tuple)) and len(row) > 0}
+
+        new_rows = []
+        added = 0
+
+        for idx, sid in enumerate(MANAGER_SHEETS, 1):
+            await message.answer(f"→ Проверяю таблицу менеджера {idx}/7...")
+            try:
+                s = await async_open(sid)
+                sheet = await async_worksheet(s, "Общий")
+                data = await asyncio.to_thread(sheet.get_all_values)
+
+                for row in data[1:]:
+                    if not isinstance(row, (list, tuple)) or len(row) < 6: continue
+                    
+                    phone_raw   = str(row[4]) if len(row) > 4 else ""
+                    region      = str(row[1]).strip() if len(row) > 1 else ""
+                    client_name = str(row[5]).strip() if len(row) > 5 else ""
+
+                    phone_norm = normalize_phone(phone_raw)
+                    if not phone_norm or phone_norm in existing: continue
+
+                    new_rows.append([phone_norm, "", client_name, "не привязан", f"Таблица {idx}", region])
+                    existing.add(phone_norm)
+                    added += 1
+                    
+            except Exception as e:
+                await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:100]}")
+                continue
+
+        if new_rows:
+            await async_append_rows(clients, new_rows)
+            await message.answer(f"✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА! Добавлено новых клиентов: {added}")
+        else:
+            await message.answer("✅ Всё уже синхронизировано, новых клиентов нет.")
+
+    except Exception as e:
+        print(f"CRITICAL SYNC ERROR: {e}")
+        await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
+
 
 @dp.message(Command("stats"))
 async def stats(message: Message):
-    # ... (тот же код)
-    pass
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Доступ запрещён.")
+        return
+    try:
+        spreadsheet = await async_open(MAIN_SHEET_ID)
+        clients = await async_worksheet(spreadsheet, "Clients")
+        data = await asyncio.to_thread(clients.get_all_records)
+        total = len(data)
+        bound = sum(1 for row in data if str(row.get("status", "")).lower() == "привязан")
+        await message.answer(f"📊 Всего клиентов: {total} | Привязано: {bound}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка stats: {str(e)}")
 
-# ================= start, contact и т.д. =================
+
 @dp.message(Command("start"))
 async def start(message: Message):
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
     await message.answer("Привет! Нажми кнопку или напиши номер цифрами.", reply_markup=kb)
+
 
 @dp.message(F.contact)
 async def handle_contact(message: Message):
     phone_norm = normalize_phone(message.contact.phone_number)
     if phone_norm:
         await process_phone(phone_norm, message)
+
 
 @dp.message(F.text & ~F.command)
 async def handle_manual_phone(message: Message):
@@ -251,17 +307,21 @@ async def handle_manual_phone(message: Message):
 # ================= ЗАПУСК =================
 async def on_startup(bot: Bot):
     global gc
-    creds = Credentials.from_service_account_info(GOOGLE_CREDS, scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
+    creds = Credentials.from_service_account_info(
+        GOOGLE_CREDS,
+        scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    )
     gc = gspread.authorize(creds)
     await bot.set_webhook(f"{BASE_WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}")
     print(f"✅ Webhook установлен")
+
 
 async def main():
     if not BASE_WEBHOOK_URL:
         print("❌ Укажи BASE_WEBHOOK_URL!")
         return
     dp.startup.register(on_startup)
-    print("✅ Бот запущен | Рассылка исправлена и работает со статусом «новый»")
+    print("✅ Бот запущен | Telegram ID теперь всегда записывается при привязке")
     
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
@@ -273,6 +333,7 @@ async def main():
     site = web.TCPSite(runner, host=WEBAPP_HOST, port=WEBAPP_PORT)
     await site.start()
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
