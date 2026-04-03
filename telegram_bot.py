@@ -3,16 +3,16 @@ import logging
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.constants import ParseMode
 from aiohttp import web
 
-from config import TELEGRAM_BOT_TOKEN, ADMIN_ID, MAIN_SHEET_ID, MANAGER_SHEETS, WEBHOOK_URL, WEBHOOK_PATH, PORT
+# В импорт добавлена GOOGLE_CREDS_JSON
+from config import TELEGRAM_BOT_TOKEN, ADMIN_ID, MAIN_SHEET_ID, MANAGER_SHEETS, WEBHOOK_URL, WEBHOOK_PATH, PORT, GOOGLE_CREDS_JSON
 from google_sheets import init_google_sheets, async_open, async_worksheet, async_get_all_values, async_append_rows, async_batch_update
 
 logging.basicConfig(level=logging.INFO)
 
 # --------------------------------------------
-# Функции работы с Google Sheets (такие же)
+# Функции работы с номерами и Google Sheets
 # --------------------------------------------
 def normalize_phone(raw):
     if not raw:
@@ -83,7 +83,7 @@ async def process_phone(phone_norm: str, user_id: int, user_name: str = ""):
         await application.bot.send_message(user_id, "❌ Ошибка при обработке номера.")
 
 # --------------------------------------------
-# Обработчики команд
+# Обработчики команд Telegram
 # --------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = ReplyKeyboardMarkup(
@@ -275,6 +275,7 @@ async def on_startup():
 
 async def main():
     global application
+    # Инициализация Google Sheets с использованием GOOGLE_CREDS_JSON
     init_google_sheets(GOOGLE_CREDS_JSON)
     logging.info("Google Sheets initialized")
 
@@ -285,7 +286,6 @@ async def main():
     application.add_handler(MessageHandler(filters.CONTACT, contact))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # Настройка вебхука
     await application.initialize()
     await on_startup()
 
@@ -298,7 +298,6 @@ async def main():
     await site.start()
     logging.info(f"Server started on port {PORT}")
 
-    # Ожидание
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
