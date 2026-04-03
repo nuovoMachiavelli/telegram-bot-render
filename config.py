@@ -11,7 +11,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 PORT = int(os.getenv("PORT", "8080"))
 
-# Таблицы менеджеров (те же ID)
+# Таблицы менеджеров (те же самые)
 MANAGER_SHEETS = [
     "1uURwa7q2o_PSzqkXAvobFk-iy1gS9k4JGFmevF1O7NU",
     "1od2y0ZwNpe7myLZfXqgN_Dpwx4fG2g69ByYTW-eECwU",
