@@ -125,20 +125,19 @@ async def process_phone(phone_norm: str, message: Message):
         print(f"CRITICAL ERROR в process_phone: {e}")
         await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= УМНЫЙ /sync — ОБНОВЛЯЕТ ФИО =================
+# ================= СИНХРОНИЗАЦИЯ (полностью как в MAX) =================
 @dp.message(Command("sync"))
 async def sync_clients(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещён.")
         return
 
-    await message.answer("🔄 Запускаю оптимизированную синхронизацию (batch_update)...")
+    await message.answer("🔄 Запускаю синхронизацию (batch_update)...")
 
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         clients = await async_worksheet(spreadsheet, "Clients")
         
-        # Загружаем текущих клиентов один раз
         values = await asyncio.to_thread(clients.get_all_values)
         existing = {}
         for i, row in enumerate(values[1:], start=2):
@@ -148,7 +147,7 @@ async def sync_clients(message: Message):
                     existing[phone_norm] = i
 
         new_rows = []
-        batch_updates = []   # ← здесь собираем всё
+        batch_updates = []
         updated = 0
         added = 0
 
@@ -172,7 +171,6 @@ async def sync_clients(message: Message):
 
                     if phone_norm in existing:
                         r = existing[phone_norm]
-                        # Обновляем C, E, F одной операцией (D пропускаем)
                         batch_updates.append({
                             "range": f"C{r}:F{r}",
                             "values": [[client_name, None, f"Таблица {idx}", region]]
@@ -185,46 +183,37 @@ async def sync_clients(message: Message):
                 await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:100]}")
                 continue
 
-        # === ОДИН batch-запрос вместо сотен ===
         if batch_updates:
-            await asyncio.to_thread(
-                clients.batch_update,
-                batch_updates,
-                value_input_option="RAW"
-            )
-
+            await asyncio.to_thread(clients.batch_update, batch_updates, value_input_option="RAW")
         if new_rows:
             await async_append_rows(clients, new_rows)
 
-        await message.answer(f"""✅ УМНАЯ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!
-
+        await message.answer(f"""✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!
 Добавлено новых: {added}
-Обновлено ФИО/регион/источник: {updated}
-(все обновления — 1 запрос к Google)""")
+Обновлено ФИО/регион/источник: {updated}""")
 
     except Exception as e:
         print(f"CRITICAL SYNC ERROR: {e}")
         await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
 
-# ================= ОПТИМИЗИРОВАННАЯ РАССЫЛКА С BATCH UPDATE =================
+# ================= РАССЫЛКА (только из колонки H, статус в J, время в K) =================
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещён.")
         return
     
-    await message.answer("🚀 Запускаю оптимизированную рассылку...")
+    await message.answer("🚀 Запускаю рассылку (текст из колонки 'сообщение')...")
     
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         rassylka = await async_worksheet(spreadsheet, "Рассылка")
         clients_sheet = await async_worksheet(spreadsheet, "Clients")
         
-        # Загружаем данные
         data = await asyncio.to_thread(rassylka.get_all_values)
         clients_data = await asyncio.to_thread(clients_sheet.get_all_values)
         
-        # Создаём маппинг телефон → chat_id
+        # Маппинг телефон → chat_id
         phone_to_tg = {}
         for row in clients_data[1:]:
             if isinstance(row, (list, tuple)) and len(row) > 1:
@@ -234,75 +223,58 @@ async def broadcast_cmd(message: Message):
                     if tg_id and tg_id != "0":
                         phone_to_tg[phone_norm] = tg_id
         
-        # Собираем batch-обновления здесь
-        status_updates = []  # Для статусов в колонке I
-        time_updates = []    # Для времени в колонке J
+        status_updates = []   # колонка J (индекс 9)
+        time_updates = []     # колонка K (индекс 10)
         
         sent = 0
-        skipped = 0
+        skipped_no_text = 0
+        skipped_no_id = 0
         errors = 0
         batch_counter = 0
         
         for i, row in enumerate(data[1:], start=2):
-            if not isinstance(row, (list, tuple)) or len(row) < 9:
+            if len(row) < 10:
                 continue
             
-            status = str(row[8]).strip().lower() if len(row) > 8 else ""
+            # Статус в колонке J
+            status = str(row[9]).strip().lower() if len(row) > 9 else ""
             if status not in ("новый", ""):
                 continue
             
-            phone_raw = str(row[2]) if len(row) > 2 else ""
-            shop_number = str(row[4]).strip() if len(row) > 4 else "—"
-            amount = str(row[5]).strip() if len(row) > 5 else "—"
-            link = str(row[6]).strip() if len(row) > 6 else ""
-            period = str(row[7]).strip() if len(row) > 7 else "—"
+            # Текст из колонки H
+            message_text = str(row[7]).strip() if len(row) > 7 and row[7] else ""
+            if not message_text:
+                status_updates.append({"range": f"J{i}", "values": [["нет текста"]]})
+                skipped_no_text += 1
+                batch_counter += 1
+                continue
             
+            # Телефон в колонке C
+            phone_raw = str(row[2]) if len(row) > 2 else ""
             phone_norm = normalize_phone(phone_raw)
             if not phone_norm:
                 continue
             
             tg_id = phone_to_tg.get(phone_norm)
-            
             if not tg_id:
-                status_updates.append({
-                    "range": f"I{i}",
-                    "values": [["нет Telegram ID"]]
-                })
-                skipped += 1
+                status_updates.append({"range": f"J{i}", "values": [["нет Telegram ID"]]})
+                skipped_no_id += 1
                 batch_counter += 1
             else:
-                text = f"""Оплата за магазин {shop_number}
-Сумма {amount}
-За период {period}
-{link}"""
-                
                 try:
-                    await bot.send_message(chat_id=int(tg_id), text=text)
+                    await bot.send_message(chat_id=int(tg_id), text=message_text)
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    status_updates.append({
-                        "range": f"I{i}",
-                        "values": [["отправлено"]]
-                    })
-                    time_updates.append({
-                        "range": f"J{i}",
-                        "values": [[now]]
-                    })
-                    
+                    status_updates.append({"range": f"J{i}", "values": [["отправлено"]]})
+                    time_updates.append({"range": f"K{i}", "values": [[now]]})
                     sent += 1
                     batch_counter += 2
-                    await asyncio.sleep(0.5)  # Меньше задержка, т.к. меньше запросов к API
-                    
+                    await asyncio.sleep(0.5)
                 except Exception as e:
                     err_text = str(e)[:80]
-                    status_updates.append({
-                        "range": f"I{i}",
-                        "values": [[f"ошибка: {err_text}"]]
-                    })
+                    status_updates.append({"range": f"J{i}", "values": [[f"ошибка: {err_text}"]]})
                     errors += 1
                     batch_counter += 1
             
-            # Каждые 50 операций — сбрасываем batch
             if batch_counter >= 50:
                 if status_updates:
                     await asyncio.to_thread(rassylka.batch_update, status_updates, value_input_option="RAW")
@@ -311,9 +283,8 @@ async def broadcast_cmd(message: Message):
                     await asyncio.to_thread(rassylka.batch_update, time_updates, value_input_option="RAW")
                     time_updates = []
                 batch_counter = 0
-                await asyncio.sleep(1)  # Небольшая пауза между batches
+                await asyncio.sleep(1)
         
-        # Финальный сброс оставшихся обновлений
         if status_updates:
             await asyncio.to_thread(rassylka.batch_update, status_updates, value_input_option="RAW")
         if time_updates:
@@ -321,15 +292,15 @@ async def broadcast_cmd(message: Message):
         
         await message.answer(f"""🎉 РАССЫЛКА ЗАВЕРШЕНА!
 ✅ Отправлено: {sent}
-⏭ Пропущено: {skipped}
-❌ Ошибок: {errors}
-💡 Batch-обновления уменьшили запросы к API""")
+⏭ Пропущено (нет текста в H): {skipped_no_text}
+⏭ Пропущено (нет Telegram ID): {skipped_no_id}
+❌ Ошибок: {errors}""")
         
     except Exception as e:
         print(f"CRITICAL BROADCAST ERROR: {e}")
         await message.answer(f"❌ Критическая ошибка рассылки: {str(e)}")
 
-# ================= start, contact, manual =================
+# ================= ОБРАБОТЧИКИ КОМАНД И НОМЕРОВ =================
 @dp.message(Command("start"))
 async def start(message: Message):
     kb = ReplyKeyboardMarkup(
@@ -345,13 +316,11 @@ async def handle_contact(message: Message):
     if phone_norm:
         await process_phone(phone_norm, message)
 
-# ================= ИСПРАВЛЕННАЯ ФУНКЦИЯ =================
 @dp.message(F.text & ~F.command)
 async def handle_manual_phone(message: Message):
-    # Если сообщение начинается с '/' — пропускаем (это команда, которую не распознал фильтр)
+    # Игнорируем сообщения, начинающиеся с '/'
     if message.text.startswith('/'):
         return
-    
     phone_norm = normalize_phone(message.text)
     if phone_norm:
         await message.answer("🔍 Проверяю номер...")
@@ -359,7 +328,7 @@ async def handle_manual_phone(message: Message):
     else:
         await message.answer("Пожалуйста, отправьте номер в правильном формате (только цифры).")
 
-# ================= ЗАПУСК =================
+# ================= ЗАПУСК ВЕБХУКА =================
 async def on_startup(bot: Bot):
     global gc
     creds = Credentials.from_service_account_info(
@@ -376,7 +345,7 @@ async def main():
         return
     
     dp.startup.register(on_startup)
-    print("✅ Бот запущен | /sync теперь обновляет ФИО + рассылка работает")
+    print("✅ Бот запущен | Синхронизация и рассылка работают")
     
     app = web.Application()
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
