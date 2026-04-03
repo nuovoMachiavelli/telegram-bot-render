@@ -1,4 +1,5 @@
-aiogram==3.13.1
+aiogram==3.4.1
 gspread
 google-auth
+python-dotenv
 aiohttp
