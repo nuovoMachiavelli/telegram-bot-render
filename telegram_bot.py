@@ -1,22 +1,19 @@
 import asyncio
 import logging
 from datetime import datetime
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode
 from aiohttp import web
 
 from config import TELEGRAM_BOT_TOKEN, ADMIN_ID, MAIN_SHEET_ID, MANAGER_SHEETS, WEBHOOK_URL, WEBHOOK_PATH, PORT
 from google_sheets import init_google_sheets, async_open, async_worksheet, async_get_all_values, async_append_rows, async_batch_update
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()
-
-# Функция нормализации телефона (та же)
+# --------------------------------------------
+# Функции работы с Google Sheets (такие же)
+# --------------------------------------------
 def normalize_phone(raw):
     if not raw:
         return None
@@ -27,16 +24,13 @@ def normalize_phone(raw):
         s = '7' + s
     return s if len(s) == 11 and s.startswith('7') else None
 
-# ---------- Привязка пользователя ----------
 async def process_phone(phone_norm: str, user_id: int, user_name: str = ""):
-    """Ищет номер в таблицах менеджеров, обновляет/добавляет в Clients с привязкой."""
     logging.info(f"Привязка: номер {phone_norm}, user_id {user_id}")
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         clients_ws = await async_worksheet(spreadsheet, "Clients")
         clients_values = await async_get_all_values(clients_ws)
 
-        # Поиск в таблицах менеджеров
         found_in = None
         region = ""
         client_name = ""
@@ -46,7 +40,7 @@ async def process_phone(phone_norm: str, user_id: int, user_name: str = ""):
                 sheet = await async_worksheet(s, "Общий")
                 data = await async_get_all_values(sheet)
                 for row in data[1:]:
-                    if not isinstance(row, (list, tuple)) or len(row) < 6:
+                    if len(row) < 6:
                         continue
                     phone_raw = str(row[4]) if len(row) > 4 else ""
                     if normalize_phone(phone_raw) == phone_norm:
@@ -60,10 +54,9 @@ async def process_phone(phone_norm: str, user_id: int, user_name: str = ""):
                 logging.error(f"Ошибка в таблице {idx}: {e}")
                 continue
 
-        # Поиск в Clients
         row_index = None
         for i, row in enumerate(clients_values[1:], start=2):
-            if isinstance(row, (list, tuple)) and len(row) > 0 and normalize_phone(row[0]) == phone_norm:
+            if len(row) > 0 and normalize_phone(row[0]) == phone_norm:
                 row_index = i
                 break
 
@@ -76,26 +69,54 @@ async def process_phone(phone_norm: str, user_id: int, user_name: str = ""):
                     {"range": f"E{row_index}", "values": [[found_in]]},
                     {"range": f"F{row_index}", "values": [[region]]}
                 ])
-                await bot.send_message(user_id, "✅ Вы успешно привязаны! Данные обновлены.")
+                await application.bot.send_message(user_id, "✅ Вы успешно привязаны! Данные обновлены.")
             else:
                 await async_append_rows(clients_ws, [[
                     phone_norm, user_id, client_name, "привязан", found_in, region
                 ]])
-                await bot.send_message(user_id, "✅ Вы успешно привязаны!")
+                await application.bot.send_message(user_id, "✅ Вы успешно привязаны!")
             return
         else:
-            await bot.send_message(user_id, "❌ К сожалению, ваш номер не найден в базе.")
+            await application.bot.send_message(user_id, "❌ К сожалению, ваш номер не найден в базе.")
     except Exception as e:
         logging.exception("Ошибка в process_phone")
-        await bot.send_message(user_id, "❌ Ошибка при обработке номера.")
+        await application.bot.send_message(user_id, "❌ Ошибка при обработке номера.")
 
-# ---------- Команда /sync (только админ) ----------
-@dp.message(Command("sync"))
-async def sync_command(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Доступ запрещён.")
+# --------------------------------------------
+# Обработчики команд
+# --------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await update.message.reply_text("Привет! Нажмите кнопку, чтобы поделиться номером телефона, или отправьте номер цифрами.", reply_markup=kb)
+
+async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    contact = update.message.contact
+    if contact:
+        phone_norm = normalize_phone(contact.phone_number)
+        if phone_norm:
+            await process_phone(phone_norm, update.effective_user.id, update.effective_user.full_name)
+        else:
+            await update.message.reply_text("❌ Не удалось распознать номер.")
+    else:
+        await update.message.reply_text("❌ Не удалось получить контакт.")
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone_norm = normalize_phone(update.message.text)
+    if phone_norm:
+        await update.message.reply_text("🔍 Проверяю номер...")
+        await process_phone(phone_norm, update.effective_user.id, update.effective_user.full_name)
+    else:
+        await update.message.reply_text("Пожалуйста, отправьте номер в правильном формате (только цифры).")
+
+async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
         return
-    await message.answer("🔄 Запускаю оптимизированную синхронизацию...")
+    await update.message.reply_text("🔄 Запускаю синхронизацию...")
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         clients_ws = await async_worksheet(spreadsheet, "Clients")
@@ -113,13 +134,13 @@ async def sync_command(message: types.Message):
         added = 0
 
         for idx, sid in enumerate(MANAGER_SHEETS, 1):
-            await message.answer(f"→ Проверяю таблицу менеджера {idx}/7...")
+            await update.message.reply_text(f"→ Проверяю таблицу менеджера {idx}/7...")
             try:
                 s = await async_open(sid)
                 sheet = await async_worksheet(s, "Общий")
                 data = await async_get_all_values(sheet)
                 for row in data[1:]:
-                    if not isinstance(row, (list, tuple)) or len(row) < 6:
+                    if len(row) < 6:
                         continue
                     phone_raw = str(row[4]) if len(row) > 4 else ""
                     region = str(row[1]).strip() if len(row) > 1 else ""
@@ -138,7 +159,7 @@ async def sync_command(message: types.Message):
                         new_rows.append([phone_norm, "", client_name, "не привязан", f"Таблица {idx}", region])
                         added += 1
             except Exception as e:
-                await message.answer(f"⚠️ Ошибка в таблице {idx}: {str(e)[:100]}")
+                await update.message.reply_text(f"⚠️ Ошибка в таблице {idx}: {str(e)[:100]}")
                 continue
 
         if batch_updates:
@@ -146,20 +167,16 @@ async def sync_command(message: types.Message):
         if new_rows:
             await async_append_rows(clients_ws, new_rows)
 
-        await message.answer(f"""✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!
-Добавлено новых: {added}
-Обновлено ФИО/регион/источник: {updated}""")
+        await update.message.reply_text(f"✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!\nДобавлено новых: {added}\nОбновлено: {updated}")
     except Exception as e:
         logging.exception("Sync error")
-        await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
+        await update.message.reply_text(f"❌ Ошибка синхронизации: {str(e)}")
 
-# ---------- Команда /broadcast (только админ) ----------
-@dp.message(Command("broadcast"))
-async def broadcast_command(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Доступ запрещён.")
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
         return
-    await message.answer("🚀 Запускаю рассылку (только из колонки 'сообщение')...")
+    await update.message.reply_text("🚀 Запускаю рассылку (только из колонки 'сообщение')...")
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
         rassylka_ws = await async_worksheet(spreadsheet, "Рассылка")
@@ -168,7 +185,6 @@ async def broadcast_command(message: types.Message):
         data = await async_get_all_values(rassylka_ws)
         clients_data = await async_get_all_values(clients_ws)
 
-        # Маппинг телефон → telegram_id
         phone_to_user = {}
         for row in clients_data[1:]:
             if len(row) > 1:
@@ -215,7 +231,7 @@ async def broadcast_command(message: types.Message):
                 batch_counter += 1
             else:
                 try:
-                    await bot.send_message(user_id, message_text)
+                    await context.bot.send_message(user_id, message_text)
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     status_updates.append({"range": f"J{i}", "values": [["отправлено"]]})
                     time_updates.append({"range": f"K{i}", "values": [[now]]})
@@ -243,69 +259,46 @@ async def broadcast_command(message: types.Message):
         if time_updates:
             await async_batch_update(rassylka_ws, time_updates)
 
-        await message.answer(f"""🎉 РАССЫЛКА ЗАВЕРШЕНА!
-✅ Отправлено: {sent}
-⏭ Пропущено (нет текста в H): {skipped_no_text}
-⏭ Пропущено (нет Telegram ID): {skipped_no_id}
-❌ Ошибок: {errors}""")
+        await update.message.reply_text(f"🎉 РАССЫЛКА ЗАВЕРШЕНА!\n✅ Отправлено: {sent}\n⏭ Нет текста: {skipped_no_text}\n⏭ Нет ID: {skipped_no_id}\n❌ Ошибок: {errors}")
     except Exception as e:
         logging.exception("Broadcast error")
-        await message.answer(f"❌ Критическая ошибка рассылки: {str(e)}")
+        await update.message.reply_text(f"❌ Критическая ошибка рассылки: {str(e)}")
 
-# ---------- Обработчик команды /start ----------
-@dp.message(Command("start"))
-async def start_command(message: types.Message):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    await message.answer("Привет! Нажмите кнопку, чтобы поделиться номером телефона, или отправьте номер цифрами.", reply_markup=kb)
+# --------------------------------------------
+# Запуск вебхука
+# --------------------------------------------
+application = None
 
-# ---------- Обработчик контакта ----------
-@dp.message(F.contact)
-async def handle_contact(message: types.Message):
-    phone_norm = normalize_phone(message.contact.phone_number)
-    if phone_norm:
-        user_name = message.from_user.full_name
-        await process_phone(phone_norm, message.from_user.id, user_name)
-    else:
-        await message.answer("❌ Не удалось распознать номер.")
-
-# ---------- Обработчик текстовых сообщений (ручной ввод номера) ----------
-@dp.message(F.text & ~F.command)
-async def handle_text(message: types.Message):
-    phone_norm = normalize_phone(message.text)
-    if phone_norm:
-        await message.answer("🔍 Проверяю номер...")
-        await process_phone(phone_norm, message.from_user.id, message.from_user.full_name)
-    else:
-        await message.answer("Пожалуйста, отправьте номер в правильном формате (только цифры).")
-
-# ---------- Установка вебхука и запуск ----------
-async def on_startup(bot: Bot):
-    await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+async def on_startup():
+    await application.bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
     logging.info(f"Webhook set to {WEBHOOK_URL}{WEBHOOK_PATH}")
 
 async def main():
-    # Инициализация Google Sheets
+    global application
     init_google_sheets(GOOGLE_CREDS_JSON)
     logging.info("Google Sheets initialized")
 
-    # Регистрация startup-обработчика
-    dp.startup.register(on_startup)
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("sync", sync))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(MessageHandler(filters.CONTACT, contact))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # Создание aiohttp приложения
+    # Настройка вебхука
+    await application.initialize()
+    await on_startup()
+
+    # Запуск aiohttp сервера
     app = web.Application()
-    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    webhook_handler.register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
-
+    app.router.add_post(WEBHOOK_PATH, application.webhook_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
     logging.info(f"Server started on port {PORT}")
+
+    # Ожидание
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
