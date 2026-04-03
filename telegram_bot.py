@@ -45,17 +45,21 @@ def normalize_phone(raw):
         s = '7' + s
     return s if len(s) == 11 and s.startswith('7') else None
 
-# ================= АСИНХРОННЫЕ ОБЁРТКИ =================
-async def async_open(spreadsheet_id):
-    return await asyncio.to_thread(gc.open_by_key, spreadsheet_id)
+# ================= АСИНХРОННЫЕ ОБЁРТКИ С ТАЙМАУТАМИ =================
+async def async_open(spreadsheet_id, timeout=30):
+    return await asyncio.wait_for(asyncio.to_thread(gc.open_by_key, spreadsheet_id), timeout=timeout)
 
-async def async_worksheet(spreadsheet, title):
-    return await asyncio.to_thread(spreadsheet.worksheet, title)
+async def async_worksheet(spreadsheet, title, timeout=30):
+    return await asyncio.wait_for(asyncio.to_thread(spreadsheet.worksheet, title), timeout=timeout)
 
-async def async_append_rows(worksheet, rows_list):
+async def async_append_rows(worksheet, rows_list, timeout=30):
     if not rows_list:
         return
-    return await asyncio.to_thread(worksheet.append_rows, rows_list, value_input_option="RAW")
+    return await asyncio.wait_for(asyncio.to_thread(worksheet.append_rows, rows_list, value_input_option="RAW"), timeout=timeout)
+
+async def async_batch_update(worksheet, updates, timeout=30):
+    if updates:
+        return await asyncio.wait_for(asyncio.to_thread(worksheet.batch_update, updates, value_input_option="RAW"), timeout=timeout)
 
 # ================= ОБРАБОТЧИК ОШИБОК =================
 @dp.error()
@@ -125,7 +129,7 @@ async def process_phone(phone_norm: str, message: Message):
         print(f"CRITICAL ERROR в process_phone: {e}")
         await message.answer("❌ Ошибка при обработке номера.")
 
-# ================= СИНХРОНИЗАЦИЯ (полностью как в MAX) =================
+# ================= СИНХРОНИЗАЦИЯ =================
 @dp.message(Command("sync"))
 async def sync_clients(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -184,7 +188,7 @@ async def sync_clients(message: Message):
                 continue
 
         if batch_updates:
-            await asyncio.to_thread(clients.batch_update, batch_updates, value_input_option="RAW")
+            await async_batch_update(clients, batch_updates)
         if new_rows:
             await async_append_rows(clients, new_rows)
 
@@ -196,14 +200,14 @@ async def sync_clients(message: Message):
         print(f"CRITICAL SYNC ERROR: {e}")
         await message.answer(f"❌ Ошибка синхронизации: {str(e)}")
 
-# ================= РАССЫЛКА (только из колонки H, статус в J, время в K) =================
+# ================= РАССЫЛКА (улучшенная, с таймаутами и продолжением после ошибок) =================
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещён.")
         return
     
-    await message.answer("🚀 Запускаю рассылку (текст из колонки 'сообщение')...")
+    await message.answer("🚀 Запускаю рассылку (текст из колонки H, статус из J)...")
     
     try:
         spreadsheet = await async_open(MAIN_SHEET_ID)
@@ -232,16 +236,22 @@ async def broadcast_cmd(message: Message):
         errors = 0
         batch_counter = 0
         
+        total_rows = len(data) - 1
+        processed = 0
+        
         for i, row in enumerate(data[1:], start=2):
+            processed += 1
+            # Периодически сообщаем о прогрессе
+            if processed % 50 == 0:
+                await message.answer(f"📊 Прогресс: обработано {processed} из {total_rows} строк, отправлено {sent}")
+            
             if len(row) < 10:
                 continue
             
-            # Статус в колонке J
             status = str(row[9]).strip().lower() if len(row) > 9 else ""
             if status not in ("новый", ""):
                 continue
             
-            # Текст из колонки H
             message_text = str(row[7]).strip() if len(row) > 7 and row[7] else ""
             if not message_text:
                 status_updates.append({"range": f"J{i}", "values": [["нет текста"]]})
@@ -249,7 +259,6 @@ async def broadcast_cmd(message: Message):
                 batch_counter += 1
                 continue
             
-            # Телефон в колонке C
             phone_raw = str(row[2]) if len(row) > 2 else ""
             phone_norm = normalize_phone(phone_raw)
             if not phone_norm:
@@ -262,33 +271,47 @@ async def broadcast_cmd(message: Message):
                 batch_counter += 1
             else:
                 try:
-                    await bot.send_message(chat_id=int(tg_id), text=message_text)
+                    # Отправка сообщения с таймаутом 10 секунд
+                    await asyncio.wait_for(bot.send_message(chat_id=int(tg_id), text=message_text), timeout=10)
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     status_updates.append({"range": f"J{i}", "values": [["отправлено"]]})
                     time_updates.append({"range": f"K{i}", "values": [[now]]})
                     sent += 1
                     batch_counter += 2
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)  # небольшая задержка
+                except asyncio.TimeoutError:
+                    status_updates.append({"range": f"J{i}", "values": [["ошибка: таймаут отправки"]]})
+                    errors += 1
+                    batch_counter += 1
                 except Exception as e:
                     err_text = str(e)[:80]
                     status_updates.append({"range": f"J{i}", "values": [[f"ошибка: {err_text}"]]})
                     errors += 1
                     batch_counter += 1
             
-            if batch_counter >= 50:
-                if status_updates:
-                    await asyncio.to_thread(rassylka.batch_update, status_updates, value_input_option="RAW")
-                    status_updates = []
-                if time_updates:
-                    await asyncio.to_thread(rassylka.batch_update, time_updates, value_input_option="RAW")
-                    time_updates = []
+            # Сбрасываем batch каждые 20 операций (вместо 50), чтобы избежать зависаний
+            if batch_counter >= 20:
+                try:
+                    if status_updates:
+                        await async_batch_update(rassylka, status_updates, timeout=15)
+                        status_updates = []
+                    if time_updates:
+                        await async_batch_update(rassylka, time_updates, timeout=15)
+                        time_updates = []
+                except Exception as batch_err:
+                    print(f"Ошибка batch update: {batch_err}")
+                    await message.answer(f"⚠️ Ошибка при сохранении статусов: {str(batch_err)[:100]}")
                 batch_counter = 0
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
         
-        if status_updates:
-            await asyncio.to_thread(rassylka.batch_update, status_updates, value_input_option="RAW")
-        if time_updates:
-            await asyncio.to_thread(rassylka.batch_update, time_updates, value_input_option="RAW")
+        # Финальный сброс
+        try:
+            if status_updates:
+                await async_batch_update(rassylka, status_updates, timeout=15)
+            if time_updates:
+                await async_batch_update(rassylka, time_updates, timeout=15)
+        except Exception as batch_err:
+            await message.answer(f"⚠️ Ошибка при финальном сохранении: {str(batch_err)[:100]}")
         
         await message.answer(f"""🎉 РАССЫЛКА ЗАВЕРШЕНА!
 ✅ Отправлено: {sent}
@@ -318,7 +341,6 @@ async def handle_contact(message: Message):
 
 @dp.message(F.text & ~F.command)
 async def handle_manual_phone(message: Message):
-    # Игнорируем сообщения, начинающиеся с '/'
     if message.text.startswith('/'):
         return
     phone_norm = normalize_phone(message.text)
