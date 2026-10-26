@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 import os
@@ -16,10 +17,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
 MAIN_SHEET_ID = os.getenv("MAIN_SHEET_ID")
 GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDS") or "{}")
-BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", 8080))
+
+if WEBHOOK_URL:
+    webhook_base = WEBHOOK_URL.rstrip("/")
+    if webhook_base.endswith(WEBHOOK_PATH):
+        webhook_url = webhook_base
+    else:
+        webhook_url = webhook_base + WEBHOOK_PATH
+else:
+    webhook_url = ""
 
 MANAGER_SHEETS = [
     "1uURwa7q2o_PSzqkXAvobFk-iy1gS9k4JGFmevF1O7NU",
@@ -358,12 +368,12 @@ async def on_startup(bot: Bot):
         scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     )
     gc = gspread.authorize(creds)
-    await bot.set_webhook(f"{BASE_WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}")
-    print(f"✅ Webhook установлен")
+    await bot.set_webhook(webhook_url)
+    print(f"✅ Webhook установлен: {webhook_url}")
 
 async def main():
-    if not BASE_WEBHOOK_URL:
-        print("❌ Укажи BASE_WEBHOOK_URL!")
+    if not webhook_url:
+        print("❌ Укажи WEBHOOK_URL!")
         return
     
     dp.startup.register(on_startup)
@@ -376,7 +386,7 @@ async def main():
    
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host=WEBAPP_HOST, port=WEBAPP_PORT)
+    site = web.TCPSite(app_runner=runner, host=WEBAPP_HOST, port=WEBAPP_PORT)
     await site.start()
     await asyncio.Event().wait()
 
